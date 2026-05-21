@@ -95,10 +95,6 @@ RUN_JS_ANALYSIS=true          # Phase 8: JS download + TruffleHog + regex
 RUN_PATTERN_HUNTING=true      # Phase 9: SSRF/XSS/SQLi/LFI/IDOR/CORS/HHI
 RUN_SCREENSHOTS=true          # Phase 10: Gowitness screenshots
 RUN_VHOST_DISCOVERY=true      # Phase 3: ffuf virtual-host Host-header fuzzing
-# BUG FIX (Bug 3): RUN_VHOST_DISCOVERY is now a dedicated flag separate from
-# RUN_FUZZING.  Previously, vhost scanning (a Phase 3 discovery activity) was
-# gated on RUN_FUZZING (a Phase 11 flag), causing it to be silently skipped in
-# normal mode without any indication in the mode summary.
 RUN_FUZZING=true              # Phase 11: ffuf directory brute-force
 RUN_ACTIVE_VULNS=true         # Phase 12: active vuln confirmation
 
@@ -235,9 +231,6 @@ notify() {
         -o /dev/null || true
 }
 
-# ── Checkpoint helpers ────────────────────────────────────────────────────────
-# Simple resume support for deep scans — writes phase number after completion,
-# skips already-completed phases on resume with -c flag.
 CHECKPOINT_FILE=""
 RESUME_FROM=0
 
@@ -258,8 +251,6 @@ phase_done() {
     return 1  # false = run
 }
 
-# Back up any non-empty output files before a phase re-runs on resume.
-# After the phase completes, merge_phase_backup() merges old+new findings.
 backup_phase_outputs() {
     local phase_dir="$1"
     if [ ! -d "$phase_dir" ]; then return; fi
@@ -272,7 +263,6 @@ backup_phase_outputs() {
     [ "$backed_up" -gt 0 ] && info "  Backed up $backed_up existing output files in $(basename "$phase_dir")"
 }
 
-# Merge .bak files with fresh output, deduplicate, then remove backups.
 merge_phase_backup() {
     local phase_dir="$1"
     if [ ! -d "$phase_dir" ]; then return; fi
@@ -677,12 +667,6 @@ phase2_validation() {
     info "Resolving subdomains with dnsx..."
     touch "$p2dir/wildcards.txt"
 
-    # BUG FIX: dnsx v1.2.3 does not support comma-separated inline resolvers
-    # via -r flag (that syntax requires v1.3.0+). On v1.2.3 the flag is silently
-    # ignored and dnsx falls back to the system resolver — which on VPN setups
-    # (e.g. ProtonVPN) is the VPN's internal resolver that may drop external DNS
-    # responses, causing 0 resolutions even for live subdomains.
-    # Fix: write resolvers to a temp file and pass the file path to -r instead.
     local resolvers_file="$p2dir/resolvers.txt"
     printf '8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n' > "$resolvers_file"
 
@@ -764,14 +748,6 @@ phase2_5_cloud_enum() {
     # e.g. api.staging.example.com → example; example.com → example
     #      example.co.uk → example; example.com.au → example
     #
-    # BUG FIX (Bug 5): The previous regex only handled a single optional ccTLD suffix
-    # like ".uk" (via (\.[a-z]{2})?$).  For multi-part ccTLDs such as .co.uk or
-    # .com.au it would match "co" or "com" as the SLD, producing useless bucket
-    # candidates like "co-backup".
-    #
-    # New approach: strip the rightmost two or three dot-separated labels (TLD + optional
-    # second-level registry label like "co", "com", "net", "org") then take the next
-    # label as the company name.  Handles all common patterns:
     #   example.com        → example   (strip 1 TLD label)
     #   example.co.uk      → example   (strip 2-label ccTLD)
     #   api.example.com    → example   (strip subdomain + TLD)
@@ -858,10 +834,6 @@ phase2_5_cloud_enum() {
                 200)
                     echo "$url" >> "$s3_exists"
                     echo "$url" >> "$s3_readable"
-                    # BUG FIX: The previous approach sent a real PUT with --data "",
-                    # which creates a zero-byte object on the target's bucket — actual
-                    # unauthorized modification.  Instead, probe the ?acl endpoint
-                    # (read-only) to check for AllUsers WRITE grants with no side effects.
                     local acl_resp
                     acl_resp=$(curl -sk --max-time 5 "${url}?acl" 2>/dev/null)
                     if echo "$acl_resp" | grep -q "AllUsers" && echo "$acl_resp" | grep -q "WRITE"; then
@@ -883,8 +855,6 @@ phase2_5_cloud_enum() {
     fi
 
     # Check region-specific endpoints for top candidates
-    # BUG FIX: `local` is a no-op inside a `| while` pipeline subshell — it only
-    # applies to function scope. Replaced with plain variable declarations.
     info "  Checking region-specific S3 endpoints..."
     head -50 "$candidates_file" | while IFS= read -r name; do
         for region in "${AWS_REGIONS[@]}"; do
@@ -900,9 +870,6 @@ phase2_5_cloud_enum() {
     success "S3: exists=$(count_lines "$s3_exists")  readable=$(count_lines "$s3_readable")  writable=$(count_lines "$s3_writable")"
 
     # ── 2.5.3 Google Cloud Storage Enumeration ───────────────────────────────
-    # DESIGN FIX: Was sequential (one curl at a time). Now uses xargs -P to
-    # match the S3 parallel approach — dramatically faster on large candidate
-    # lists (200+ names × 1 network round-trip each = minutes vs seconds).
     info "Testing Google Cloud Storage buckets..."
 
     local gcs_exists="$cdir/gcs/exists.txt"
@@ -923,11 +890,6 @@ phase2_5_cloud_enum() {
                 echo "$gcs_url" >> "$gcs_readable"
                 # Check IAM for allUsers with a WRITE-capable role.
                 #
-                # BUG FIX (Bug 2): The previous check only tested whether "allUsers"
-                # appeared anywhere in the IAM response.  Any publicly-readable bucket
-                # (allUsers + roles/storage.objectViewer) would match and be flagged as
-                # writable — a false positive.  We now require both "allUsers" AND one of
-                # the known write-granting roles in the same response, which correspond to:
                 #   roles/storage.objectCreator    — create/overwrite objects
                 #   roles/storage.objectAdmin      — full object control
                 #   roles/storage.legacyBucketWriter — ACL-based write
@@ -967,8 +929,6 @@ phase2_5_cloud_enum() {
     success "GCS: exists=$(count_lines "$gcs_exists")  readable=$(count_lines "$gcs_readable")  writable=$(count_lines "$gcs_writable")"
 
     # ── 2.5.4 Azure Blob Storage Enumeration ─────────────────────────────────
-    # DESIGN FIX: Was sequential (one curl per candidate). Now parallel via
-    # xargs -P, consistent with the S3 and GCS approaches above.
     info "Testing Azure Blob Storage..."
 
     local az_exists="$cdir/azure/exists.txt"
@@ -1011,9 +971,6 @@ phase2_5_cloud_enum() {
 
     # Cap Azure parallelism at half of CLOUD_ENUM_THREADS — each job fires up to
     # 8 curl requests internally, so effective concurrency is already much higher.
-    # BUG FIX (Bug C): Split local declaration from assignment — same class of bug
-    # as top_count in Phase 6b.  local var=$((...)) always exits 0, masking any
-    # arithmetic error.  Separate statements surface errors correctly.
     local azure_threads
     azure_threads=$(( CLOUD_ENUM_THREADS / 2 ))
     [ "$azure_threads" -lt 1 ] && azure_threads=1
@@ -1062,14 +1019,6 @@ phase2_5_cloud_enum() {
         2>/dev/null | sort -u > "$critical_file"
 
     # ── 2.5.7 Feed findings into Phase 5 URL corpus ──────────────────────────
-    # BUG FIX (Bug 1): The previous approach appended exposed bucket URLs
-    # directly to phase5-urls/all-urls.txt.  Phase 5 step 5.6 then overwrites
-    # that file unconditionally with "| sort -u > all-urls.txt", silently
-    # discarding every URL injected here.
-    #
-    # Fix: write to a dedicated file in the Phase 2.5 output directory.
-    # Phase 5 step 5.6 now explicitly includes this file in its merge list,
-    # so bucket URLs survive regardless of execution order.
     local cloud_urls_for_p5="$cdir/exposed/cloud-urls-for-phase5.txt"
     if [ -s "$exposed_file" ]; then
         cp "$exposed_file" "$cloud_urls_for_p5"
@@ -1148,16 +1097,6 @@ phase3_probing() {
     sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGKHF]//g" \
         "$p3dir/live-hosts-detailed.txt" > "$p3dir/clean-hosts.txt"
 
-    # BUG FIX: The previous grep -F '[200]' only matched the literal string "[200]".
-    # httpx with -follow-redirects outputs the full redirect chain, e.g. [301,302,200].
-    # "[200]" is NOT a substring of "[301,302,200]" so those hosts were silently dropped,
-    # leaving status-200.txt empty and blinding Phase 6 (Arjun), Phase 11 (fuzzing),
-    # and Phase 3 vhost discovery — all of which exclusively read from status-200.txt.
-    #
-    # Fix: use grep -E with the pattern \[([0-9]+,)*CODE\] which matches CODE as the
-    # FINAL status in the chain, whether it appears alone ([200]) or at the end of a
-    # redirect chain ([301,200] or [301,302,200]).  This correctly categorises each
-    # host by its ultimate resolved status rather than any intermediate hop.
     grep -E '\[([0-9]+,)*200\]'            "$p3dir/clean-hosts.txt" | awk '{print $1}' > "$p3dir/status-200.txt"
     grep -E '\[([0-9]+,)*403\]'            "$p3dir/clean-hosts.txt" | awk '{print $1}' > "$p3dir/status-403.txt"
     grep -E '\[([0-9]+,)*401\]'            "$p3dir/clean-hosts.txt" | awk '{print $1}' > "$p3dir/status-401.txt"
@@ -1176,9 +1115,6 @@ phase3_probing() {
     # Resolves target to IP, then fuzzes Host header against the IP so we find
     # vhosts that DON'T have their own DNS records (the whole point — Phase 1
     # already covers subdomains that resolve via DNS).
-    # BUG FIX (Bug 3): Guard changed from RUN_FUZZING to RUN_VHOST_DISCOVERY.
-    # RUN_FUZZING is a Phase 11 flag; gating a Phase 3 discovery step on it caused
-    # vhost scanning to be silently skipped in normal mode with no indication.
     if [ "$RUN_VHOST_DISCOVERY" = true ] && check_command "ffuf" && [ -f "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ]; then
         info "Running virtual host discovery via Host header injection (top 5 live hosts)..."
         local vhost_count=0
@@ -1189,13 +1125,6 @@ phase3_probing() {
             hostname=$(echo "$host" | sed -E 's|https?://||; s|/.*||; s|:[0-9]+$||')
 
             # Resolve hostname to IP for direct connection.
-            # BUG FIX (Bug A): dig +short outputs CNAME aliases before the final A
-            # record when a CNAME chain exists (e.g. cdn-alias.cloudfront.net → 1.2.3.4).
-            # head -1 used to take the CNAME string, which failed the IP regex and
-            # silently skipped the host with a misleading "could not resolve" message —
-            # even though the host resolves perfectly via DNS.
-            # Fix: filter dig output for IPv4 addresses only before taking head -1,
-            # so CNAME entries in the chain are discarded before the first IP is selected.
             target_ip=$(dig +short "$hostname" A 2>/dev/null \
                 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
             if [ -z "$target_ip" ]; then
@@ -1344,10 +1273,6 @@ phase5_url_discovery() {
     success "GAU: $(count_lines "$p5dir/gau-urls.txt") URLs"
 
     # 5.6 Merge all URL sources — explicit list prevents self-inclusion bug
-    # BUG FIX (Bug 1): Added phase2.5-cloud/exposed/cloud-urls-for-phase5.txt to
-    # the merge list.  Previously Phase 2.5 appended bucket URLs directly to
-    # all-urls.txt, but this step's redirect (>) then overwrote them completely.
-    # Now the cloud URL file is a named source in the merge, so it always survives.
     info "Merging and deduplicating all URL sources..."
     local cloud_p5_feed="$OUTPUT_DIR/phase2.5-cloud/exposed/cloud-urls-for-phase5.txt"
     cat "$p5dir/katana-urls.txt" \
@@ -1424,9 +1349,6 @@ phase6_parameters() {
 
     # 6.1 Passive parameter extraction with Unfurl
     info "Extracting known parameters from URL corpus with Unfurl..."
-    # BUG FIX: 2>/dev/null must redirect unfurl's stderr, not sort's.
-    # Previously the redirect was on the sort command (last in pipeline), so
-    # unfurl errors still printed to the terminal.
     unfurl keys < "$p5dir/all-urls.txt" 2>/dev/null \
         | sort -u > "$p6dir/parameters.txt"
     success "Unique parameter names: $(count_lines "$p6dir/parameters.txt")"
@@ -1460,32 +1382,6 @@ phase6_parameters() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 6b: Asset Scoring & Prioritization
-# ─────────────────────────────────────────────────────────────────────────────
-# Synthesizes data from Phases 1–6 to rank hosts by attack potential so that
-# expensive downstream phases (Nuclei, JS analysis, fuzzing, active confirm)
-# can prioritize high-value targets — especially useful on constrained systems.
-#
-# The score is a weighted sum of multiple signals:
-#
-#   Signal                           Points  Rationale
-#   ──────────────────────────────── ──────  ────────────────────────────────
-#   Status 200 (reachable)              5    Baseline: host is testable
-#   Status 401 (auth required)         15    Auth bypass / credential bugs
-#   Status 403 (forbidden)             15    403 bypass, misconfig, ACL bugs
-#   Status 500 (server error)          20    Fragile backend, crash-prone
-#   Non-standard port web service      10    Forgotten / dev / admin services
-#   API endpoint on this host           3    Each API path = injection surface
-#   Sensitive endpoint (admin/debug)    5    High-impact if accessible
-#   Interesting file (config/bak/env)   4    Direct information disclosure
-#   GF pattern match URL                2    Pre-qualified for specific vuln class
-#   Live JS file on this host           2    Potential for secret extraction
-#   Discovered parameter                1    Each param = injection point
-#   Interesting tech stack keyword     10    WordPress, Jira, Jenkins, etc.
-#
-# Output:
-#   asset-scoring/scored-targets.txt      — full ranked list (score | reasons | host)
-#   asset-scoring/top-targets.txt         — top 25% hosts for focused testing
-#   asset-scoring/scoring-summary.txt     — human-readable breakdown per host
 # ─────────────────────────────────────────────────────────────────────────────
 phase_asset_scoring() {
     # NOTE: No checkpoint guard — this phase is a fast local computation (no
@@ -1721,9 +1617,6 @@ phase_asset_scoring() {
     sort -t'|' -k1 -rn "$scored_file" -o "$scored_file"
 
     # ── Generate top-targets list (top 25%, minimum 5) ───────────────────────
-    # BUG FIX: `local var=$(command)` always exits 0 in bash, masking the
-    # return code of the right-hand side.  Split into two statements so any
-    # arithmetic error (e.g. unexpected non-integer in total_hosts) surfaces.
     local top_count
     top_count=$(( total_hosts / 4 ))
     [ "$top_count" -lt 5 ] && top_count=5
@@ -1917,9 +1810,6 @@ phase8_javascript_analysis() {
     phase_done 8 && { polite_sleep; return; }
     print_phase "📜 PHASE 8: JAVASCRIPT ANALYSIS & SECRET EXTRACTION"
 
-    # BUG FIX: Guard must come before backup_phase_outputs.
-    # Previously, backup created .bak files then returned early, orphaning them
-    # permanently — merge_phase_backup was never reached.
     if [ "$RUN_JS_ANALYSIS" = false ]; then
         info "JavaScript analysis skipped (mode: $SCAN_MODE)."
         return
@@ -2061,9 +1951,6 @@ phase8_javascript_analysis() {
     p8_secrets=$(count_lines "$p8dir/trufflehog-summary.txt")
     p8_aws=$(count_lines "$p8dir/aws-access-keys.txt")
     p8_privkeys=$(count_lines "$p8dir/private-keys.txt")
-    # BUG FIX (Bug C): Split local declaration from arithmetic assignment — same
-    # class as top_count in Phase 6b.  local var=$((...)) exits 0 unconditionally,
-    # masking any arithmetic error from non-numeric count_lines output.
     local p8_total
     p8_total=$(( p8_secrets + p8_aws + p8_privkeys ))
     if [ "$p8_total" -gt 0 ]; then
@@ -2084,8 +1971,6 @@ phase9_pattern_hunting() {
     phase_done 9 && { polite_sleep; return; }
     print_phase "🎯 PHASE 9: VULNERABILITY PATTERN HUNTING"
 
-    # BUG FIX: Guard must come before backup_phase_outputs (same class of bug as
-    # Phase 8) — returning early after backup leaves .bak files permanently orphaned.
     if [ "$RUN_PATTERN_HUNTING" = false ]; then
         info "Vulnerability pattern hunting skipped (mode: $SCAN_MODE)."
         return
@@ -2192,11 +2077,6 @@ phase9_pattern_hunting() {
     success "LFI candidates: $(count_lines "$p9dir/lfi-candidates.txt")"
 
     # 9.6 IDOR candidates — numeric IDs in parameters are prime IDOR targets
-    # BUG FIX (Bug B): All other Phase 9 vuln types prefer gf-<type>.txt (higher
-    # signal, curated patterns) and fall back to grep only when GF output is absent.
-    # IDOR was the sole exception — it went straight to grep, silently ignoring
-    # gf-idor.txt even when Phase 5 step 5.9 produced it.  Now follows the same
-    # gf-first / grep-fallback pattern as SSRF, redirect, XSS, SQLi, and LFI.
     info "Finding IDOR candidates (numeric param values)..."
     if [ -s "$p5dir/gf-idor.txt" ]; then
         cp "$p5dir/gf-idor.txt" "$p9dir/idor-candidates.txt"
@@ -2297,16 +2177,12 @@ phase9_pattern_hunting() {
     p9_ssrf=$(count_lines "$p9dir/ssrf-candidates.txt")
     p9_xss=$(count_lines "$p9dir/dalfox-xss-confirmed.txt")
     p9_hhi=$(count_lines "$p9dir/host-injection-findings.txt")
-    # BUG FIX (Bug C): Split local declaration from arithmetic assignment — same
-    # class as top_count in Phase 6b.  local var=$((...)) exits 0 unconditionally,
-    # masking any arithmetic error from non-numeric count_lines output.
     local p9_total
     p9_total=$(( p9_cors + p9_ssrf + p9_xss + p9_hhi ))
     if [ "$p9_total" -gt 0 ]; then
         notify "🎯 Pattern Hits — Phase 9" \
             "Vulnerability patterns detected on \`${TARGET}\`:\nCORS misconfigs: *${p9_cors}*\nSSRF candidates: *${p9_ssrf}*\nXSS confirmed: *${p9_xss}*\nHost-header inject: *${p9_hhi}*"
     fi
-    # NOTE: polite_sleep omitted — parallel phase; see Phase 8 note.
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2383,7 +2259,6 @@ phase10_screenshots() {
     fi
 
     success "Phase 10 complete!"
-    # NOTE: polite_sleep omitted — parallel phase; see Phase 8 note.
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2466,7 +2341,6 @@ phase11_fuzzing() {
     fi
 
     success "Phase 11 complete!"
-    # NOTE: polite_sleep omitted — parallel phase; see Phase 8 note.
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2476,10 +2350,6 @@ phase12_active_vulns() {
     phase_done 12 && { polite_sleep; return; }
     print_phase "🔥 PHASE 12: ACTIVE VULNERABILITY CONFIRMATION"
 
-    # BUG FIX: Guard must come before backup_phase_outputs.
-    # Previously, backup created .bak files then returned early, orphaning them
-    # permanently — merge_phase_backup was never reached.  Same class of bug
-    # that was already fixed in phases 8 and 9.
     if [ "$RUN_ACTIVE_VULNS" = false ]; then
         info "Active vulnerability confirmation skipped (mode: $SCAN_MODE)."
         return
@@ -2826,10 +2696,6 @@ main() {
 
     create_structure
 
-    # BUG FIX: CHECKPOINT_FILE must be set AFTER create_structure() because
-    # create_structure() resolves OUTPUT_DIR to an absolute path. Setting it
-    # before meant the checkpoint could be written to a relative path that
-    # breaks if any subshell changes directory during the scan.
     CHECKPOINT_FILE="$OUTPUT_DIR/.checkpoint"
 
     phase1_subdomain_discovery
@@ -2841,18 +2707,8 @@ main() {
     phase6_parameters
     phase_asset_scoring
     phase7_vulnerability_scanning
-    # ── Phases 8–11: Independent phases — run in parallel ────────────────
-    # Phases 8 (JS), 9 (patterns), 10 (screenshots), and 11 (fuzzing) all
-    # read from phases 1–7 and write to their own directories — they are
-    # fully independent of each other.  Running them in parallel can cut
-    # wall-clock time significantly.
-    #
-    # Phase 12 depends on Phase 9 output, so it must wait until all
-    # parallel phases complete.
-    #
-    # Each phase runs in a subshell so local variables don't collide.
-    # We capture PIDs and wait for all before proceeding.
 
+    # Phases 8-11 are independent — run in parallel
     local parallel_pids=()
 
     phase8_javascript_analysis &
