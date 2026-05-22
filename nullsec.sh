@@ -1607,15 +1607,17 @@ phase_asset_scoring() {
         fi
 
         # ── Non-standard port services ───────────────────────────────────
-        # BUG-12 NOTE: grep -cF returns exit-status 1 on zero matches while
-        # still printing "0" to stdout.  The assignments below are safe because
-        # `local var=$(...)` always returns 0 regardless of the subshell's exit
-        # status.  Do NOT split these into `local var; var=$(grep -cF ...)`
-        # without adding `|| true` — that form propagates exit-1 and, if set -e
-        # is ever re-enabled, will abort the scoring loop silently.
+        # BUG-12 NOTE: grep -cF prints "0" AND exits 1 on zero matches.  Using
+        # `grep ... || echo 0` therefore captures TWO lines ("0\n0"), which
+        # breaks the subsequent `[ "$count" -gt 0 ]` test with "integer
+        # expression expected".  The fix wraps grep in a brace group and pipes
+        # to `head -1` so we always take the first line — grep's own "0" on
+        # no-match, grep's actual count on a match, or echo's "0" if grep
+        # failed entirely (file unreadable, etc.).  Do NOT simplify this back
+        # to a bare $(grep -cF ... || echo 0) form.
         local alt_port_count=0
         if [ -s "$tmp_dir/alt-ports" ]; then
-            alt_port_count=$(grep -cF "$hostname" "$tmp_dir/alt-ports" 2>/dev/null || echo 0)
+            alt_port_count=$( { grep -cF "$hostname" "$tmp_dir/alt-ports" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$alt_port_count" -gt 0 ]; then
             local pts=$((alt_port_count * 10))
@@ -1626,7 +1628,7 @@ phase_asset_scoring() {
         # ── API endpoints ────────────────────────────────────────────────
         local api_count=0
         if [ -s "$tmp_dir/apis" ]; then
-            api_count=$(grep -cF "$hostname" "$tmp_dir/apis" 2>/dev/null || echo 0)
+            api_count=$( { grep -cF "$hostname" "$tmp_dir/apis" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$api_count" -gt 0 ]; then
             local pts=$((api_count * 3))
@@ -1637,7 +1639,7 @@ phase_asset_scoring() {
         # ── Sensitive endpoints ──────────────────────────────────────────
         local sens_count=0
         if [ -s "$tmp_dir/sensitive" ]; then
-            sens_count=$(grep -cF "$hostname" "$tmp_dir/sensitive" 2>/dev/null || echo 0)
+            sens_count=$( { grep -cF "$hostname" "$tmp_dir/sensitive" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$sens_count" -gt 0 ]; then
             local pts=$((sens_count * 5))
@@ -1648,7 +1650,7 @@ phase_asset_scoring() {
         # ── Interesting files (config/bak/env) ───────────────────────────
         local int_count=0
         if [ -s "$tmp_dir/interesting" ]; then
-            int_count=$(grep -cF "$hostname" "$tmp_dir/interesting" 2>/dev/null || echo 0)
+            int_count=$( { grep -cF "$hostname" "$tmp_dir/interesting" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$int_count" -gt 0 ]; then
             local pts=$((int_count * 4))
@@ -1659,7 +1661,7 @@ phase_asset_scoring() {
         # ── GF pattern matches ───────────────────────────────────────────
         local gf_count=0
         if [ -s "$gf_merged" ]; then
-            gf_count=$(grep -cF "$hostname" "$gf_merged" 2>/dev/null || echo 0)
+            gf_count=$( { grep -cF "$hostname" "$gf_merged" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$gf_count" -gt 0 ]; then
             local pts=$((gf_count * 2))
@@ -1670,7 +1672,7 @@ phase_asset_scoring() {
         # ── Live JS files ────────────────────────────────────────────────
         local js_count=0
         if [ -s "$tmp_dir/jsfiles" ]; then
-            js_count=$(grep -cF "$hostname" "$tmp_dir/jsfiles" 2>/dev/null || echo 0)
+            js_count=$( { grep -cF "$hostname" "$tmp_dir/jsfiles" 2>/dev/null || echo 0; } | head -1)
         fi
         if [ "$js_count" -gt 0 ]; then
             local pts=$((js_count * 2))
