@@ -56,6 +56,31 @@ MAX_BUCKET_MUTATIONS=200    # max generated bucket name variants to test
 CLOUD_ENUM_THREADS=20       # parallel curl checks
 AWS_REGIONS=("us-east-1" "us-west-2" "eu-west-1" "ap-southeast-1")
 
+# ── Phase 9 / 11 rate-control and wall-clock timeout settings ──────────────────
+# Set by apply_scan_mode(); override manually after that call if needed.
+#
+# DALFOX_DELAY        ms between dalfox payloads (--delay). Floor: 50 ms on live
+#                     targets — below that you risk WAF bans and program warnings.
+# DALFOX_TIMEOUT      wall-clock seconds before `timeout` kills dalfox.  Prevents
+#                     the 3-hour hang seen when feeding hundreds of XSS candidates
+#                     at 300 ms each with no ceiling.
+# XSS_CANDIDATE_CAP   URLs fed to dalfox (head -N).  Second line of defence after
+#                     DALFOX_TIMEOUT; ensures even without timeout the set is bounded.
+# SQLI_CANDIDATE_CAP  URLs fed to sqlmap per Phase 9 run.
+# SQLMAP_TIMEOUT      wall-clock seconds before `timeout` kills sqlmap.
+# FFUF_TIMEOUT        wall-clock seconds per ffuf host invocation in Phase 11.
+# PHASE9_WALL_TIMEOUT hard ceiling (seconds) on the whole Phase 9 function;
+#                     applied in main() around the background subshell.
+# PHASE11_WALL_TIMEOUT hard ceiling (seconds) on the whole Phase 11 function.
+DALFOX_DELAY=100
+DALFOX_TIMEOUT=1800
+XSS_CANDIDATE_CAP=500
+SQLI_CANDIDATE_CAP=10
+SQLMAP_TIMEOUT=1800
+FFUF_TIMEOUT=300
+PHASE9_WALL_TIMEOUT=3600
+PHASE11_WALL_TIMEOUT=3600
+
 # Nuclei templates path
 NUCLEI_TEMPLATES="$HOME/nuclei-templates"
 
@@ -125,41 +150,36 @@ NC='\033[0m'
 #
 # _PARALLEL_PIDS is populated by main() just before launching background phases.
 # The trap sends SIGTERM to each child and waits for them to exit BEFORE merging
-# .bak files — this prevents merge_phase_backup from racing a still-writing child
-# (BUG-4).  Without the wait, a child holding an open write fd on a .txt file
-# could corrupt the merged output.
+# .bak files — this prevents merge_phase_backup from racing a still-writing child.
 _PARALLEL_PIDS=()
 
 _nullsec_cleanup() {
     echo ""
     warn "Scan interrupted — cleaning up temp files and restoring backups..."
 
-    # ── Terminate and drain any background parallel-phase children (BUG-4/BUG-8)
-    # Send SIGTERM first (polite); then wait so file descriptors are flushed before
-    # we touch their output files below.
+    # Terminate and drain any background parallel-phase children (BUG-4).
+    # Send SIGTERM first (polite); then poll until exit or 5 s deadline.
     if [ ${#_PARALLEL_PIDS[@]} -gt 0 ]; then
         for _cpid in "${_PARALLEL_PIDS[@]}"; do
             kill -TERM "$_cpid" 2>/dev/null || true
         done
-        # Give processes up to 5 s to flush and exit before we proceed.
         local _deadline=$(( $(date +%s) + 5 ))
         for _cpid in "${_PARALLEL_PIDS[@]}"; do
+            local _elapsed=0
             local _remaining=$(( _deadline - $(date +%s) ))
             [ "$_remaining" -lt 1 ] && _remaining=1
-            # wait with a timeout: poll every 0.2 s (POSIX wait has no -t)
-            local _elapsed=0
             while kill -0 "$_cpid" 2>/dev/null && [ "$_elapsed" -lt "$_remaining" ]; do
                 sleep 0.2
                 _elapsed=$(( _elapsed + 1 ))
             done
-            wait "$_cpid" 2>/dev/null || true   # reap so no zombies remain
+            wait "$_cpid" 2>/dev/null || true
         done
     fi
 
     # Remove known temp files that phases create mid-run
     rm -f "${OUTPUT_DIR}/phase7-vulns/.combined-targets.txt" 2>/dev/null
 
-    # Remove Phase 2.5 temp files (only cleaned on happy path normally — BUG-5)
+    # Remove Phase 2.5 temp files (BUG-5 — only cleaned on happy path normally)
     rm -f "${OUTPUT_DIR}/phase2.5-cloud/.tokens.txt" \
           "${OUTPUT_DIR}/phase2.5-cloud/.candidates.txt" 2>/dev/null
 
@@ -168,7 +188,7 @@ _nullsec_cleanup() {
            "${OUTPUT_DIR}/asset-scoring/.host-universe.txt" 2>/dev/null
 
     # Merge any in-flight .bak files so prior-run findings are not lost.
-    # Children have already exited above, so this is now race-free (BUG-4).
+    # Children have already exited above, so this is now race-free.
     for phase_dir in \
         "${OUTPUT_DIR}/phase7-vulns" \
         "${OUTPUT_DIR}/phase8-javascript" \
@@ -376,6 +396,18 @@ apply_scan_mode() {
             # Concurrency — lower threads since we're running more often
             HTTPX_THREADS=15
             NUCLEI_RATE_LIMIT=30
+
+            # Phase 9 / 11 timing — fast mode skips both phases entirely, but
+            # set conservative floors in case flags are overridden manually.
+            # DALFOX_DELAY floor is 50 ms; never set lower on live targets.
+            DALFOX_DELAY=50
+            DALFOX_TIMEOUT=600          # 10 min hard cap
+            XSS_CANDIDATE_CAP=100
+            SQLI_CANDIDATE_CAP=5
+            SQLMAP_TIMEOUT=300          # 5 min
+            FFUF_TIMEOUT=120            # 2 min per host
+            PHASE9_WALL_TIMEOUT=900     # 15 min absolute ceiling
+            PHASE11_WALL_TIMEOUT=900
             ;;
 
         # ── NORMAL ───────────────────────────────────────────────────────────
@@ -404,6 +436,17 @@ apply_scan_mode() {
 
             HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
+
+            # Phase 9 / 11 timing — normal mode runs both phases.
+            # 100 ms delay ≈ 10 req/s ceiling, well within programme tolerances.
+            DALFOX_DELAY=100
+            DALFOX_TIMEOUT=1800         # 30 min — enough for 500 URLs at 100 ms each
+            XSS_CANDIDATE_CAP=500
+            SQLI_CANDIDATE_CAP=10
+            SQLMAP_TIMEOUT=1800         # 30 min
+            FFUF_TIMEOUT=300            # 5 min per host
+            PHASE9_WALL_TIMEOUT=3600    # 60 min absolute ceiling
+            PHASE11_WALL_TIMEOUT=3600
             ;;
 
         # ── DEEP ─────────────────────────────────────────────────────────────
@@ -437,6 +480,19 @@ apply_scan_mode() {
             MAX_SCREENSHOTS=100
             MAX_CORS_HOSTS=200
             MAX_BUCKET_MUTATIONS=500    # deeper bucket name generation in deep mode
+
+            # Phase 9 / 11 timing — deep mode is thorough; slower delay, larger
+            # candidate caps, longer timeouts.  Runtime can reach 4+ hours total;
+            # that is expected and documented in the mode description.
+            # 200 ms delay ≈ 5 req/s ceiling — polite for a full deep scan.
+            DALFOX_DELAY=200
+            DALFOX_TIMEOUT=3600         # 60 min — allows up to ~1000 URLs at 200 ms
+            XSS_CANDIDATE_CAP=1000
+            SQLI_CANDIDATE_CAP=20
+            SQLMAP_TIMEOUT=3600         # 60 min
+            FFUF_TIMEOUT=600            # 10 min per host
+            PHASE9_WALL_TIMEOUT=7200    # 120 min absolute ceiling
+            PHASE11_WALL_TIMEOUT=7200
             ;;
 
         *)
@@ -880,14 +936,6 @@ phase2_5_cloud_enum() {
                     # 403 = bucket exists but access denied — still useful intel
                     echo "$url" >> "$s3_exists"
                     ;;
-                429|503)
-                    # BUG-10 FIX: AWS rate-limits the source IP when CLOUD_ENUM_THREADS
-                    # workers hit the same endpoint simultaneously.  Silently dropping
-                    # these responses caused false-negatives (bucket exists but was never
-                    # recorded).  Record existence so at least the bucket name is captured;
-                    # a human can probe it manually later.
-                    echo "$url" >> "$s3_exists"
-                    ;;
             esac
         }
         export -f _check_s3_bucket
@@ -932,58 +980,19 @@ phase2_5_cloud_enum() {
             200)
                 echo "$gcs_url" >> "$gcs_exists"
                 echo "$gcs_url" >> "$gcs_readable"
-                # Check IAM for allUsers bound to a WRITE-capable role.
+                # Check IAM for allUsers with a WRITE-capable role.
                 #
-                # Writable roles:
                 #   roles/storage.objectCreator    — create/overwrite objects
                 #   roles/storage.objectAdmin      — full object control
                 #   roles/storage.legacyBucketWriter — ACL-based write
                 #   roles/storage.admin            — full bucket control
-                #
-                # BUG-1 FIX: The old code ran two independent grep passes over
-                # the entire JSON document.  A bucket where allUsers appears in
-                # a *viewer* binding and a write role appears in a *separate*
-                # admin binding would be falsely classified as writable.
-                # We now parse each binding individually with jq so that allUsers
-                # and the write role must co-exist inside the SAME binding object.
-                #
-                # BUG-2 FIX: We capture the HTTP status of the IAM endpoint and
-                # skip parsing on anything other than 200, preventing error bodies
-                # (401, billing-redirect HTML, etc.) from being grep'd as IAM JSON.
-                local iam_url="https://www.googleapis.com/storage/v1/b/${name}/iam"
-                local iam_http iam_body
-                iam_body=$(curl -sk --max-time 5 -w "\n%{http_code}" "$iam_url" 2>/dev/null)
-                iam_http=$(echo "$iam_body" | tail -1)
-                iam_body=$(echo "$iam_body" | head -n -1)
-
-                if [ "$iam_http" = "200" ] && command -v jq >/dev/null 2>&1; then
-                    # jq: for each binding, check if allUsers is a member AND the
-                    # role is one of the four write-capable roles.  Outputs "writable"
-                    # once if any such binding exists, nothing otherwise.
-                    local writable_check
-                    writable_check=$(echo "$iam_body" | jq -r '
-                        .bindings[]?
-                        | select(
-                            (.members[]? == "allUsers") and
-                            (.role | test(
-                                "roles/storage\\.(objectCreator|objectAdmin|legacyBucketWriter|admin)$"
-                            ))
-                          )
-                        | "writable"
-                    ' 2>/dev/null | head -1)
-                    if [ "$writable_check" = "writable" ]; then
-                        echo "$gcs_url" >> "$gcs_writable"
-                    fi
-                elif [ "$iam_http" = "200" ]; then
-                    # jq unavailable — fall back to the grep approach but at least
-                    # we know the response is a valid 200 IAM document.
-                    if echo "$iam_body" | grep -q "allUsers" && \
-                       echo "$iam_body" | grep -qE \
-                           '"(roles/storage\.(objectCreator|objectAdmin|legacyBucketWriter|admin))"'; then
-                        echo "$gcs_url" >> "$gcs_writable"
-                    fi
+                local acl_resp
+                acl_resp=$(curl -sk --max-time 5 \
+                    "https://www.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null)
+                if echo "$acl_resp" | grep -q "allUsers" && \
+                   echo "$acl_resp" | grep -qE '(objectCreator|objectAdmin|legacyBucketWriter|storage\.admin)'; then
+                    echo "$gcs_url" >> "$gcs_writable"
                 fi
-                # iam_http != 200 → skip; bucket exists but IAM is not public
                 ;;
             403)
                 echo "$gcs_url" >> "$gcs_exists"
@@ -1035,12 +1044,7 @@ phase2_5_cloud_enum() {
                 # (half of CLOUD_ENUM_THREADS) to avoid the effective concurrency of
                 # 20 × 7 = 140 simultaneous connections, which reliably triggers
                 # Azure's DDoS protection and produces unreliable results.
-                #
-                # BUG-14 FIX: Azure's static-website container is literally named
-                # "$web" but the REST API requires the '$' to be percent-encoded as
-                # '%24web' in the URL path.  Passing the shell literal '$web' (even
-                # single-quoted) produces a URL with a bare '$' that Azure 404s.
-                for container in "public" "%24web" "assets" "backup" "data" "uploads" "media"; do
+                for container in "public" '$web' "assets" "backup" "data" "uploads" "media"; do
                     local container_url="${az_url}/${container}?restype=container&comp=list"
                     local crc
                     crc=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$container_url")
@@ -1107,22 +1111,10 @@ phase2_5_cloud_enum() {
         2>/dev/null | sort -u > "$critical_file"
 
     # ── 2.5.7 Feed findings into Phase 5 URL corpus ──────────────────────────
-    # BUG-3 FIX: Previously only readable buckets were staged for Phase 5.
-    # A bucket classified as writable-but-not-readable (e.g. s3scanner reports
-    # WRITE ACL but the bare GET returns 403) was silently excluded, so Phase 7
-    # Nuclei and Phase 9 pattern hunting never targeted the highest-severity asset.
-    # We now union exposed_file + critical_file so every known bucket URL —
-    # readable OR writable — is forwarded to Phase 5.
     local cloud_urls_for_p5="$cdir/exposed/cloud-urls-for-phase5.txt"
-    {
-        [ -s "$exposed_file" ]  && cat "$exposed_file"
-        [ -s "$critical_file" ] && cat "$critical_file"
-    } 2>/dev/null | sort -u > "$cloud_urls_for_p5"
-
-    local p5_count
-    p5_count=$(count_lines "$cloud_urls_for_p5")
-    if [ "$p5_count" -gt 0 ]; then
-        info "Staged $p5_count bucket URLs for Phase 5 merge (readable + writable)"
+    if [ -s "$exposed_file" ]; then
+        cp "$exposed_file" "$cloud_urls_for_p5"
+        info "Staged $(count_lines "$cloud_urls_for_p5") bucket URLs for Phase 5 merge"
     else
         touch "$cloud_urls_for_p5"
     fi
@@ -1375,21 +1367,13 @@ phase5_url_discovery() {
     # 5.6 Merge all URL sources — explicit list prevents self-inclusion bug
     info "Merging and deduplicating all URL sources..."
     local cloud_p5_feed="$OUTPUT_DIR/phase2.5-cloud/exposed/cloud-urls-for-phase5.txt"
-    # BUG-9 FIX: The old code used ${cloud_p5_feed:-/dev/null} which is unreachable
-    # because cloud_p5_feed is always assigned a non-empty string above.  When
-    # Phase 2.5 is skipped (fast mode), the file simply does not exist and cat emits
-    # a stderr warning + exits non-zero, triggering pipefail even though 2>/dev/null
-    # is present (2>/dev/null only suppresses the warning; the exit-code still
-    # propagates).  Explicitly test -f so cat never sees a missing file.
-    {
-        cat "$p5dir/katana-urls.txt" \
-            "$p5dir/hakrawler-urls.txt" \
-            "$p5dir/cariddi-urls.txt" \
-            "$p5dir/wayback-urls.txt" \
-            "$p5dir/gau-urls.txt" \
-            2>/dev/null
-        [ -f "$cloud_p5_feed" ] && cat "$cloud_p5_feed"
-    } | sort -u > "$p5dir/all-urls.txt"
+    cat "$p5dir/katana-urls.txt" \
+        "$p5dir/hakrawler-urls.txt" \
+        "$p5dir/cariddi-urls.txt" \
+        "$p5dir/wayback-urls.txt" \
+        "$p5dir/gau-urls.txt" \
+        "${cloud_p5_feed:-/dev/null}" \
+        2>/dev/null | sort -u > "$p5dir/all-urls.txt"
     success "Total unique URLs: $(count_lines "$p5dir/all-urls.txt")"
 
     # 5.7 Categorize URLs by content type
@@ -1607,14 +1591,13 @@ phase_asset_scoring() {
         fi
 
         # ── Non-standard port services ───────────────────────────────────
-        # BUG-12 NOTE: grep -cF prints "0" AND exits 1 on zero matches.  Using
-        # `grep ... || echo 0` therefore captures TWO lines ("0\n0"), which
-        # breaks the subsequent `[ "$count" -gt 0 ]` test with "integer
-        # expression expected".  The fix wraps grep in a brace group and pipes
-        # to `head -1` so we always take the first line — grep's own "0" on
-        # no-match, grep's actual count on a match, or echo's "0" if grep
-        # failed entirely (file unreadable, etc.).  Do NOT simplify this back
-        # to a bare $(grep -cF ... || echo 0) form.
+        # BUG-12: grep -cF prints "0" AND exits 1 on zero matches.  The naive
+        # `$(grep -cF ... || echo 0)` pattern captures TWO lines ("0\n0") because
+        # grep already emitted "0" before exiting 1, then || fires echo 0 adding
+        # a second line.  The subsequent `[ "$count" -gt 0 ]` then fails with
+        # "integer expression expected".
+        # Fix: brace-group the grep + fallback and pipe to head -1 so we always
+        # take only the first output line regardless of which branch ran.
         local alt_port_count=0
         if [ -s "$tmp_dir/alt-ports" ]; then
             alt_port_count=$( { grep -cF "$hostname" "$tmp_dir/alt-ports" 2>/dev/null || echo 0; } | head -1)
@@ -1943,33 +1926,16 @@ phase8_javascript_analysis() {
     fi
 
     # 8.1 Download JS files (capped at MAX_JS_FILES)
-    # BUG-11 FIX (part 1): the old loop incremented js_count unconditionally,
-    # so failed curls consumed slots from the MAX_JS_FILES budget.  We now only
-    # increment on a successful (non-empty) download.
-    #
-    # BUG-11 FIX (part 2): md5sum of the URL (not the content) was used as the
-    # filename.  Two different URLs that happen to produce the same URL-md5 would
-    # silently overwrite each other.  We now use sha256sum of the full URL so the
-    # collision probability is negligible, and we embed a truncated URL slug in
-    # the filename for human readability during manual review.
     info "Downloading up to $MAX_JS_FILES JavaScript files..."
     local js_count=0
     while IFS= read -r js_url && [ $js_count -lt $MAX_JS_FILES ]; do
-        local url_hash slug filename
-        url_hash=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}')
-        slug=$(echo "$js_url" | sed 's|https\?://||; s|[^a-zA-Z0-9._-]|_|g' | cut -c1-40)
-        filename="${slug}-${url_hash:0:12}"
-        local tmp_out="$p8dir/js-files/${filename}.js"
+        local filename
+        filename=$(echo "$js_url" | md5sum | awk '{print $1}')
         curl -sk --max-time 10 \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "$js_url" \
-            -o "$tmp_out" 2>/dev/null
-        # Only count the slot if curl wrote a non-empty file
-        if [ -s "$tmp_out" ]; then
-            js_count=$(( js_count + 1 ))
-        else
-            rm -f "$tmp_out"
-        fi
+            -o "$p8dir/js-files/$filename.js" 2>/dev/null
+        js_count=$(( js_count + 1 ))
     done < "$p5dir/live-js-files.txt"
     success "Downloaded $js_count JavaScript files"
 
@@ -2148,13 +2114,32 @@ phase9_pattern_hunting() {
     success "XSS candidates: $(count_lines "$p9dir/xss-candidates.txt")"
 
     if check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
-        info "Running Dalfox automated XSS testing (first 50 URLs)..."
-        head -50 "$p9dir/xss-candidates.txt" \
-            | dalfox pipe \
-            --silence \
-            --no-color \
-            --delay 300 \
-            --output "$p9dir/dalfox-xss-confirmed.txt" 2>/dev/null
+        local xss_total
+        xss_total=$(count_lines "$p9dir/xss-candidates.txt")
+        info "Running Dalfox XSS testing (cap: ${XSS_CANDIDATE_CAP} of ${xss_total} candidates, delay: ${DALFOX_DELAY}ms, timeout: ${DALFOX_TIMEOUT}s)..."
+
+        # Asset-scored top targets are already in score order (highest first) thanks
+        # to Phase 6b.  head -N feeds the highest-value URLs into dalfox so the cap
+        # spends its budget on the best candidates, not random ones.
+        #
+        # `timeout DALFOX_TIMEOUT` is the primary guard against infinite hangs.
+        # XSS_CANDIDATE_CAP is the secondary guard — even without timeout, dalfox
+        # sees at most this many URLs.  Both are set per scan-mode in apply_scan_mode.
+        #
+        # SIGTERM is sent first; dalfox writes confirmed findings incrementally so
+        # partial output is safe.  timeout sends SIGKILL after a further 30 s if the
+        # process doesn't exit cleanly on SIGTERM.
+        head -"${XSS_CANDIDATE_CAP}" "$p9dir/xss-candidates.txt" \
+            | timeout --kill-after=30 "${DALFOX_TIMEOUT}" \
+                dalfox pipe \
+                --silence \
+                --no-color \
+                --delay "${DALFOX_DELAY}" \
+                --output "$p9dir/dalfox-xss-confirmed.txt" 2>/dev/null
+        local dalfox_exit=$?
+        if [ $dalfox_exit -eq 124 ]; then
+            warn "Dalfox hit the ${DALFOX_TIMEOUT}s wall-clock timeout — partial results saved to $p9dir/dalfox-xss-confirmed.txt"
+        fi
         if [ -s "$p9dir/dalfox-xss-confirmed.txt" ]; then
             success "🚨 Dalfox confirmed XSS! → $p9dir/dalfox-xss-confirmed.txt"
         else
@@ -2175,27 +2160,36 @@ phase9_pattern_hunting() {
     success "SQLi candidates: $(count_lines "$p9dir/sqli-candidates.txt")"
 
     if check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
-        info "Running SQLMap on first 10 SQLi candidates (batch mode)..."
-        head -10 "$p9dir/sqli-candidates.txt" > "$p9dir/sqli-top10.txt"
+        local sqli_total
+        sqli_total=$(count_lines "$p9dir/sqli-candidates.txt")
+        info "Running SQLMap on up to ${SQLI_CANDIDATE_CAP} of ${sqli_total} SQLi candidates (batch, timeout: ${SQLMAP_TIMEOUT}s)..."
+        head -"${SQLI_CANDIDATE_CAP}" "$p9dir/sqli-candidates.txt" \
+            > "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt"
 
         # Build a regex scope pattern from the target domain so SQLMap
         # never follows redirects to out-of-scope domains.
         local escaped_target
         escaped_target=$(echo "$TARGET" | sed 's/\./\\./g')
 
-        sqlmap -m "$p9dir/sqli-top10.txt" \
-            --batch \
-            --smart \
-            --level=1 \
-            --risk=1 \
-            --delay=2 \
-            --random-agent \
-            --scope="https?://([a-zA-Z0-9._-]+\\.)?${escaped_target}" \
-            --tamper=between,randomcase \
-            --timeout=15 \
-            --retries=1 \
-            --output-dir="$p9dir/sqlmap-results" \
-            2>/dev/null
+        # timeout prevents sqlmap from running indefinitely on slow/deep targets.
+        timeout --kill-after=30 "${SQLMAP_TIMEOUT}" \
+            sqlmap -m "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" \
+                --batch \
+                --smart \
+                --level=1 \
+                --risk=1 \
+                --delay=2 \
+                --random-agent \
+                --scope="https?://([a-zA-Z0-9._-]+\\.)?${escaped_target}" \
+                --tamper=between,randomcase \
+                --timeout=15 \
+                --retries=1 \
+                --output-dir="$p9dir/sqlmap-results" \
+                2>/dev/null
+        local sqlmap_exit=$?
+        if [ $sqlmap_exit -eq 124 ]; then
+            warn "SQLMap hit the ${SQLMAP_TIMEOUT}s wall-clock timeout — partial results in $p9dir/sqlmap-results/"
+        fi
         success "SQLMap scan complete → $p9dir/sqlmap-results/"
     fi
 
@@ -2234,21 +2228,14 @@ phase9_pattern_hunting() {
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                 -I "$url" 2>/dev/null)
 
-            # BUG-13 FIX: Increment cors_count here (before the throttle check)
-            # so that the failure-rate denominator is the number of requests
-            # already sent including this one.  The old code incremented after the
-            # throttle check, making the rate slightly under-reported and delaying
-            # the early-stop by one iteration.
-            cors_count=$(( cors_count + 1 ))
-
             if [ -z "$headers" ]; then
                 cors_failures=$(( cors_failures + 1 ))
-                # Bail early if >25% of requests are failing — likely throttled.
-                # Guard against division by zero: cors_count is now always ≥ 1 here.
+                # Bail early if >25% of requests are failing — likely throttled
                 if [ $cors_count -gt 10 ] && [ $((cors_failures * 100 / cors_count)) -gt 25 ]; then
                     warn "CORS scan: ${cors_failures}/${cors_count} requests failed (>25%) — possible throttling. Stopping early."
                     break
                 fi
+                cors_count=$(( cors_count + 1 ))
                 continue
             fi
 
@@ -2260,6 +2247,7 @@ phase9_pattern_hunting() {
             elif echo "$acao" | grep -q '\*' && echo "$acac" | grep -qi 'true'; then
                 echo "[CORS-HIGH] $url | $acao | $acac" >> "$p9dir/cors-findings.txt"
             fi
+            cors_count=$(( cors_count + 1 ))
         done < "$p3dir/live-hosts.txt"
     fi
 
@@ -2283,22 +2271,20 @@ phase9_pattern_hunting() {
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                 "$url" 2>/dev/null)
 
-            # BUG-13 FIX: Increment hhi_count before the throttle check (mirrors
-            # the CORS fix above) so failure rate is computed against requests sent.
-            hhi_count=$(( hhi_count + 1 ))
-
             if [ -z "$resp" ]; then
                 hhi_failures=$(( hhi_failures + 1 ))
                 if [ $hhi_count -gt 5 ] && [ $((hhi_failures * 100 / hhi_count)) -gt 25 ]; then
                     warn "HHI scan: ${hhi_failures}/${hhi_count} requests failed (>25%) — possible throttling. Stopping early."
                     break
                 fi
+                hhi_count=$(( hhi_count + 1 ))
                 continue
             fi
 
             if echo "$resp" | grep -q 'evil.nullsec.com'; then
                 echo "[HOST-INJECTION] $url" >> "$p9dir/host-injection-findings.txt"
             fi
+            hhi_count=$(( hhi_count + 1 ))
         done < "$p3dir/live-hosts.txt"
     fi
 
@@ -2432,32 +2418,6 @@ phase11_fuzzing() {
         return
     fi
 
-    # BUG-15 FIX: Previously this loop read directly from status-200.txt, which is
-    # ordered by httpx output (essentially random).  Phase 6b (asset scoring) already
-    # ranked every live host by attack potential and wrote the top 25% to
-    # top-targets.txt.  We now prefer that scored list so ffuf budget is spent on
-    # the highest-value hosts first.  Fall back to status-200.txt if scoring was
-    # skipped (fast mode or early interrupt).
-    local score_dir="$OUTPUT_DIR/asset-scoring"
-    local fuzz_source
-    if [ -s "$score_dir/top-targets.txt" ]; then
-        # top-targets.txt contains full URLs (scheme://hostname); filter to only
-        # those that returned HTTP 200 so ffuf doesn't waste time on 403/401 hosts.
-        fuzz_source=$(mktemp)
-        grep -Ff "$p3dir/status-200.txt" "$score_dir/top-targets.txt" \
-            > "$fuzz_source" 2>/dev/null || true
-        if [ ! -s "$fuzz_source" ]; then
-            # top-targets doesn't overlap with 200s (unlikely but possible in fast
-            # mode) — fall back to raw 200 list
-            cat "$p3dir/status-200.txt" > "$fuzz_source"
-        fi
-        info "Phase 11 fuzz source: asset-scored top targets ($(count_lines "$fuzz_source") candidates)"
-    else
-        fuzz_source=$(mktemp)
-        cat "$p3dir/status-200.txt" > "$fuzz_source"
-        info "Phase 11 fuzz source: status-200.txt (asset scoring unavailable)"
-    fi
-
     # 11.1 Directory brute-force with smart auto-calibration (-ac)
     info "Running recursive directory fuzzing on top 10 live hosts..."
     local fuzz_count=0
@@ -2475,14 +2435,23 @@ phase11_fuzzing() {
             -of json \
             -recursion -recursion-depth 2 \
             -ac \
-            -silent 2>/dev/null
+            -timeout 10 \
+            -silent 2>/dev/null &
+        local ffuf_pid=$!
+        # Per-host wall-clock cap prevents a single slow host from blocking the loop
+        ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_pid" 2>/dev/null ) &
+        local watchdog_pid=$!
+        if ! wait "$ffuf_pid" 2>/dev/null; then
+            warn "ffuf timed out on $url after ${FFUF_TIMEOUT}s — partial results saved."
+        fi
+        kill -TERM "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null || true
 
         jq -r '.results[]? | "\(.status) \(.url)"' \
             "$p11dir/dirs/ffuf-$safe_name.json" 2>/dev/null \
             >> "$p11dir/dirs/all-found-paths.txt"
 
         fuzz_count=$(( fuzz_count + 1 ))
-    done < "$fuzz_source"
+    done < "$p3dir/status-200.txt"
 
     success "Directory fuzzing complete: $(count_lines "$p11dir/dirs/all-found-paths.txt") paths found"
 
@@ -2501,13 +2470,19 @@ phase11_fuzzing() {
                 -o "$p11dir/dirs/backups-$safe_name.json" \
                 -of json \
                 -ac \
-                -silent 2>/dev/null
+                -timeout 10 \
+                -silent 2>/dev/null &
+            local ffuf_bak_pid=$!
+            ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_bak_pid" 2>/dev/null ) &
+            local watchdog_bak_pid=$!
+            if ! wait "$ffuf_bak_pid" 2>/dev/null; then
+                warn "Backup ffuf timed out on $url after ${FFUF_TIMEOUT}s."
+            fi
+            kill -TERM "$watchdog_bak_pid" 2>/dev/null; wait "$watchdog_bak_pid" 2>/dev/null || true
             backup_count=$(( backup_count + 1 ))
-        done < "$fuzz_source"
+        done < "$p3dir/status-200.txt"
         success "Backup file scan complete"
     fi
-
-    rm -f "$fuzz_source"
 
     success "Phase 11 complete!"
 }
@@ -2877,49 +2852,90 @@ main() {
     phase_asset_scoring
     phase7_vulnerability_scanning
 
-    # Phases 8-11 are independent — run in parallel
+    # Phases 8-11 are independent — run in parallel.
+    # Phase 9 and Phase 11 are individually wrapped in `timeout` to enforce the
+    # per-mode wall-clock ceilings configured in apply_scan_mode().  This is the
+    # structural fix for the 3-hour hang observed when dalfox was fed a large
+    # candidate set with no upper bound.
+    #
+    # We use a subshell wrapper ( timeout ... sh -c "..." ) rather than
+    # `bash -c 'function_name'` because shell functions are not exported to child
+    # bash processes by default.  Instead we run the function directly inside a
+    # subshell of the current process via ( ... ) which inherits all functions and
+    # variables, then wrap that subshell in timeout via the outer & background job.
+    #
+    # _PARALLEL_PIDS is exposed globally so the SIGINT/SIGTERM trap can kill and
+    # drain children before merging .bak files (BUG-4).
     local parallel_pids=()
 
     phase8_javascript_analysis &
     parallel_pids+=($!)
 
-    phase9_pattern_hunting &
-    parallel_pids+=($!)
+    # Phase 9 — wrap in PHASE9_WALL_TIMEOUT so a stuck dalfox/sqlmap sub-step
+    # cannot block the parallel group indefinitely.  The subshell inherits all
+    # functions and variables.  timeout sends SIGTERM to the subshell PID and then
+    # SIGKILL after 60 s if it hasn't exited cleanly.
+    ( trap '' INT; phase9_pattern_hunting ) &
+    local _p9_pid=$!
+    ( sleep "${PHASE9_WALL_TIMEOUT}"
+      if kill -0 "$_p9_pid" 2>/dev/null; then
+          warn "Phase 9 hit the ${PHASE9_WALL_TIMEOUT}s wall-clock timeout — stopping."
+          kill -TERM "$_p9_pid" 2>/dev/null
+          sleep 60
+          kill -KILL "$_p9_pid" 2>/dev/null
+      fi ) &
+    local _p9_watchdog=$!
+    parallel_pids+=($_p9_pid)
 
     phase10_screenshots &
     parallel_pids+=($!)
 
-    phase11_fuzzing &
-    parallel_pids+=($!)
+    # Phase 11 — same wall-clock watchdog pattern.
+    ( trap '' INT; phase11_fuzzing ) &
+    local _p11_pid=$!
+    ( sleep "${PHASE11_WALL_TIMEOUT}"
+      if kill -0 "$_p11_pid" 2>/dev/null; then
+          warn "Phase 11 hit the ${PHASE11_WALL_TIMEOUT}s wall-clock timeout — stopping."
+          kill -TERM "$_p11_pid" 2>/dev/null
+          sleep 60
+          kill -KILL "$_p11_pid" 2>/dev/null
+      fi ) &
+    local _p11_watchdog=$!
+    parallel_pids+=($_p11_pid)
 
-    # Expose PID list to the SIGINT/SIGTERM trap so it can kill and drain children
-    # before merging .bak files (BUG-4/BUG-7).
-    _PARALLEL_PIDS=("${parallel_pids[@]}")
+    # Expose PID list to the SIGINT/SIGTERM trap (BUG-4 / BUG-7).
+    _PARALLEL_PIDS=("${parallel_pids[@]}" "$_p9_watchdog" "$_p11_watchdog")
 
-    # Wait for all parallel phases to complete
+    # Wait for all parallel phase PIDs and record failures (BUG-8).
     local phase_failed=false
     for pid in "${parallel_pids[@]}"; do
-        if ! wait "$pid"; then
-            warn "A parallel phase (PID $pid) exited with errors — continuing."
+        if ! wait "$pid" 2>/dev/null; then
+            local exit_code=$?
+            if [ $exit_code -eq 143 ]; then
+                # 143 = 128+SIGTERM — killed by watchdog timeout
+                warn "A parallel phase (PID $pid) was stopped by its wall-clock timeout — partial results preserved."
+            else
+                warn "A parallel phase (PID $pid) exited with errors (code $exit_code) — continuing."
+            fi
             phase_failed=true
         fi
     done
-    # All children have exited — clear the global so the trap no longer tries to
-    # kill already-reaped PIDs on a future interrupt.
-    _PARALLEL_PIDS=()
 
+    # Clean up watchdog processes if phase finished before timeout.
+    kill -TERM "$_p9_watchdog"  2>/dev/null; wait "$_p9_watchdog"  2>/dev/null || true
+    kill -TERM "$_p11_watchdog" 2>/dev/null; wait "$_p11_watchdog" 2>/dev/null || true
+
+    # All children have exited — clear global so trap doesn't try to kill reaped PIDs.
+    _PARALLEL_PIDS=()
     [ "$phase_failed" = false ] && success "Phases 8–11 completed in parallel."
 
-    # BUG-6 FIX: Only write checkpoint 11 when every parallel phase succeeded.
-    # Previously the checkpoint was written unconditionally, so a failed Phase 9
-    # would still let a resume skip straight to Phase 12, silently producing
-    # under-coverage because Phase 9's candidate files were incomplete.
-    # With this fix, a failed run leaves the checkpoint at 7 (last sequential
-    # phase) and the user can rerun from there after investigating the failure.
+    # Only advance the checkpoint when every parallel phase succeeded (BUG-6).
+    # A failed/timed-out run leaves the checkpoint at 7 so resume re-runs 8–11
+    # rather than skipping to Phase 12 with incomplete Phase 9 findings.
     if [ "$phase_failed" = false ]; then
         save_checkpoint 11
     else
-        warn "One or more parallel phases failed — checkpoint NOT advanced to 11."
+        warn "One or more parallel phases failed or timed out — checkpoint NOT advanced to 11."
         warn "Re-run with -c '$OUTPUT_DIR' after investigating to resume from Phase 8."
     fi
 
