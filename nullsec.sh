@@ -42,6 +42,7 @@ GAU_THREADS=5
 ARJUN_THREADS=10
 FFUF_THREADS=20
 NUCLEI_RATE_LIMIT=50   # requests/second — lower if target is sensitive
+NUCLEI_CONCURRENCY=25  # template/bulk-size workers — must stay ≤ NUCLEI_MHE (30)
 GOWITNESS_THREADS=4
 
 # Limits
@@ -397,6 +398,7 @@ apply_scan_mode() {
             # Concurrency — lower threads since we're running more often
             HTTPX_THREADS=15
             NUCLEI_RATE_LIMIT=30
+            NUCLEI_CONCURRENCY=15  # well below MHE default (30); fast mode is gentle
 
             # Phase 9 / 11 timing — fast mode skips both phases entirely, but
             # set conservative floors in case flags are overridden manually.
@@ -437,6 +439,7 @@ apply_scan_mode() {
 
             HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
+            NUCLEI_CONCURRENCY=25  # balanced; stays under MHE default (30)
 
             # Phase 9 / 11 timing — normal mode runs both phases.
             # 100 ms delay ≈ 10 req/s ceiling, well within programme tolerances.
@@ -476,6 +479,7 @@ apply_scan_mode() {
 
             HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
+            NUCLEI_CONCURRENCY=25  # deep scans hit larger host sets; keep under MHE (30)
             MAX_JS_FILES=100
             MAX_ARJUN_HOSTS=5
             MAX_SCREENSHOTS=100
@@ -1754,6 +1758,24 @@ phase_asset_scoring() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _p7_report_skips <logfile> <scan_label>
+# Parses Nuclei stderr for "[skipped]" lines that indicate a host was dropped
+# due to hitting max-host-error.  Emits a warning for each skipped host so
+# coverage gaps are visible in the run log rather than silently absent from
+# findings.  The raw log is preserved in the phase7 output directory.
+_p7_report_skips() {
+    local logfile="$1" label="$2"
+    [ -f "$logfile" ] || return
+    local skipped
+    skipped=$(grep -c "\[skipped\]" "$logfile" 2>/dev/null || echo 0)
+    if [ "$skipped" -gt 0 ]; then
+        warn "$label: $skipped host(s) skipped due to error threshold — check $(basename "$logfile") for details"
+        grep "\[skipped\]" "$logfile" | while IFS= read -r line; do
+            warn "  → $line"
+        done
+    fi
+}
+
 # PHASE 7: Vulnerability Scanning (Nuclei)
 # ─────────────────────────────────────────────────────────────────────────────
 phase7_vulnerability_scanning() {
@@ -1833,19 +1855,25 @@ phase7_vulnerability_scanning() {
     # 7.1 Consolidated severity scan against host roots only
     # BUG-2 FIX: -stats gives per-template progress so long runs don't appear
     # hung.  -stats-interval 30 logs a status line every 30 s without drowning
-    # output.  -c/-bs tuned up from Nuclei defaults (25/25) to balance
-    # throughput against the configured rate-limit.
+    # output.
+    # CONCURRENCY FIX: -c/-bs now honour NUCLEI_CONCURRENCY (set per scan mode)
+    # instead of a hardcoded 40.  -mhe is set to match so the error-ceiling is
+    # always ≥ the worker count, eliminating the "[WRN] concurrency > max-host-
+    # error" warning and preventing mid-scan host skips on fragile targets.
     info "Running consolidated Nuclei scan ($NUCLEI_SEVERITY severity)..."
     nuclei -l "$host_targets" \
         -severity "$NUCLEI_SEVERITY" \
         -exclude-tags headers,cookie-flags,info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
-        -c 40 -bs 40 \
+        -c "$NUCLEI_CONCURRENCY" -bs "$NUCLEI_CONCURRENCY" \
+        -mhe "$NUCLEI_CONCURRENCY" \
         -timeout 10 \
         -stats -stats-interval 30 \
+        -stats-json "$p7dir/scan1-stats.json" \
         -je "$p7dir/all-findings.json" \
         -o "$p7dir/all-findings.txt" \
-        2>/dev/null
+        2>"$p7dir/scan1-nuclei.log"
+    _p7_report_skips "$p7dir/scan1-nuclei.log" "7.1 severity scan"
 
     # 7.2 Exposure / misconfig scan against the full URL list
     # BUG-4 FIX: Add -exclude-severity info so info-severity exposure templates
@@ -1855,18 +1883,29 @@ phase7_vulnerability_scanning() {
     # many high-volume info-severity exposure templates carry no such tag and
     # slipped through, dramatically inflating this scan's template corpus and
     # wall-clock time.  Using -es info is the correct, severity-level gate.
+    #
+    # CONCURRENCY FIX: 7.2 targets the full URL corpus (potentially hundreds of
+    # paths per host).  A host-error skip here is more damaging than in 7.1
+    # because many templates are path-aware and won't retry.  We therefore cap
+    # concurrency at half of NUCLEI_CONCURRENCY (floored at 10) so the error
+    # budget is never exhausted by a burst of parallel workers against one host.
+    local _p7_url_conc=$(( NUCLEI_CONCURRENCY / 2 ))
+    [ "$_p7_url_conc" -lt 10 ] && _p7_url_conc=10
     info "Scanning for exposures and misconfigurations..."
     nuclei -l "$combined_targets" \
         -tags exposure,config,misconfig \
         -exclude-tags headers,cookie-flags \
         -exclude-severity info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
-        -c 40 -bs 40 \
+        -c "$_p7_url_conc" -bs "$_p7_url_conc" \
+        -mhe "$_p7_url_conc" \
         -timeout 10 \
         -stats -stats-interval 30 \
+        -stats-json "$p7dir/scan2-stats.json" \
         -je "$p7dir/exposure-findings.json" \
         -o "$p7dir/exposure-findings.txt" \
-        2>/dev/null
+        2>"$p7dir/scan2-nuclei.log"
+    _p7_report_skips "$p7dir/scan2-nuclei.log" "7.2 exposure scan"
 
     # 7.3 Split consolidated JSON into the category files other phases expect
     # BUG-5 FIX: nuclei -je (--json-export) emits a JSON ARRAY, not JSONL.
