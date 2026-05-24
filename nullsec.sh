@@ -101,8 +101,14 @@ RATE_LIMIT=false        # use -r flag to enable rate limiting between phases
 #        Then message your bot once and run:
 #          curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'
 #        to retrieve your chat ID.
-TELEGRAM_TOKEN=""
-TELEGRAM_CHAT_ID=""
+#
+# SECURITY: Never commit a real token to a public repo.  Prefer environment
+# variables (export TELEGRAM_TOKEN=... in your shell or in a .env file that is
+# gitignored) over hardcoding values here.  Anyone with the token can impersonate
+# your bot and read prior chat history.  If you accidentally commit one, revoke
+# it immediately via @BotFather → /revoke before pushing the fix.
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 #==============================================================================#
 #                         MODE-CONTROLLED SETTINGS                             #
@@ -953,7 +959,12 @@ phase2_5_cloud_enum() {
 
     # Check region-specific endpoints for top candidates
     info "  Checking region-specific S3 endpoints..."
+    # BUG-10 FIX: Declare loop-local variables explicitly.  The pipe-to-while
+    # form runs in a subshell so the leak is currently contained, but if this
+    # loop is ever refactored to a process-substitution form (`< <(head ...)`)
+    # the variables would silently leak into the parent shell.  Belt-and-braces.
     head -50 "$candidates_file" | while IFS= read -r name; do
+        local regional_url rc
         for region in "${AWS_REGIONS[@]}"; do
             regional_url="https://${name}.s3.${region}.amazonaws.com"
             rc=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$regional_url")
@@ -985,18 +996,41 @@ phase2_5_cloud_enum() {
             200)
                 echo "$gcs_url" >> "$gcs_exists"
                 echo "$gcs_url" >> "$gcs_readable"
-                # Check IAM for allUsers with a WRITE-capable role.
+                # BUG-3 FIX: Check IAM for allUsers with a WRITE-capable role.
                 #
                 #   roles/storage.objectCreator    — create/overwrite objects
                 #   roles/storage.objectAdmin      — full object control
                 #   roles/storage.legacyBucketWriter — ACL-based write
                 #   roles/storage.admin            — full bucket control
+                #
+                # Previous version used two independent grep -q calls over the
+                # whole JSON response, so `allUsers` in a READ binding plus a
+                # write role granted to any OTHER principal in a separate
+                # binding would falsely classify the bucket as writable.  Fix:
+                # parse the IAM bindings with jq and require that `allUsers`
+                # appears as a member of a binding whose role is write-capable.
+                # Falls back to the old (less precise) grep when jq is missing
+                # — better to over-report than to silently skip the check.
                 local acl_resp
                 acl_resp=$(curl -sk --max-time 5 \
                     "https://www.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null)
-                if echo "$acl_resp" | grep -q "allUsers" && \
-                   echo "$acl_resp" | grep -qE '(objectCreator|objectAdmin|legacyBucketWriter|storage\.admin)'; then
-                    echo "$gcs_url" >> "$gcs_writable"
+                if command -v jq >/dev/null 2>&1; then
+                    if echo "$acl_resp" | jq -e '
+                        .bindings[]?
+                        | select(.role | test("(objectCreator|objectAdmin|legacyBucketWriter|storage\\.admin)"))
+                        | .members[]?
+                        | select(. == "allUsers")
+                    ' >/dev/null 2>&1; then
+                        echo "$gcs_url" >> "$gcs_writable"
+                    fi
+                else
+                    # Fallback (less precise): require both substrings, mark as
+                    # suspected rather than confirmed.  Operator should install
+                    # jq for accurate classification.
+                    if echo "$acl_resp" | grep -q "allUsers" && \
+                       echo "$acl_resp" | grep -qE '(objectCreator|objectAdmin|legacyBucketWriter|storage\.admin)'; then
+                        echo "${gcs_url}  # SUSPECTED (install jq for precise check)" >> "$gcs_writable"
+                    fi
                 fi
                 ;;
             403)
@@ -1144,6 +1178,9 @@ phase2_5_cloud_enum() {
     fi
 
     # Cleanup temp files
+    # BUG-11 NOTE: This is the happy-path cleanup.  The trap _nullsec_cleanup
+    # at line ~185 removes the SAME files on SIGINT/SIGTERM.  Keep both paths
+    # in sync — if you add or rename a temp file here, update the trap too.
     rm -f "$cdir/.tokens.txt" "$cdir/.candidates.txt"
 
     success "Phase 2.5 complete!"
@@ -1766,8 +1803,13 @@ phase_asset_scoring() {
 _p7_report_skips() {
     local logfile="$1" label="$2"
     [ -f "$logfile" ] || return
+    # BUG-1 FIX: grep -c emits "0" AND exits 1 on zero matches, so the naive
+    # `grep -c ... || echo 0` pattern captures two lines ("0\n0") which fails
+    # the [ -gt 0 ] integer test below.  Brace-group the grep + fallback and
+    # pipe to head -1 so we always take only the first output line regardless
+    # of which branch ran.  (Same fix pattern as phase_asset_scoring.)
     local skipped
-    skipped=$(grep -c "\[skipped\]" "$logfile" 2>/dev/null || echo 0)
+    skipped=$( { grep -c "\[skipped\]" "$logfile" 2>/dev/null || echo 0; } | head -1)
     if [ "$skipped" -gt 0 ]; then
         warn "$label: $skipped host(s) skipped due to error threshold — check $(basename "$logfile") for details"
         grep "\[skipped\]" "$logfile" | while IFS= read -r line; do
@@ -2113,9 +2155,17 @@ phase8_javascript_analysis() {
 
     # 8.3 Endpoint discovery inside JS
     info "Discovering API endpoints embedded in JavaScript..."
+    # BUG-8 FIX: Build the endpoints list in a temp file and only move it into
+    # place after the post-loop sort -u.  Previous version wrote directly to
+    # js-endpoints.txt inside the loop, so SIGTERM mid-loop (which is likely
+    # under the parallel phase wall-clock watchdog) left a half-merged,
+    # unsorted file with duplicates that downstream httpx-toolkit would then
+    # waste requests on.
+    local js_endpoints_tmp
+    js_endpoints_tmp=$(mktemp)
     # Extract full URLs from JS (these are usable as-is)
     grep -Eo 'https?://[a-zA-Z0-9./\-_?=&%#@]+' "$p8dir/all-js-content.txt" \
-        | sort -u > "$p8dir/js-endpoints.txt" 2>/dev/null || touch "$p8dir/js-endpoints.txt"
+        | sort -u > "$js_endpoints_tmp" 2>/dev/null || true
 
     # Extract relative API paths and prepend live hosts to make them probe-able.
     # Run the grep once (not once-per-host) then fan out with sed.
@@ -2127,12 +2177,14 @@ phase8_javascript_analysis() {
             | sort -u > "$api_paths_tmp"
         if [ -s "$api_paths_tmp" ]; then
             while IFS= read -r base; do
-                sed "s|^|$base|" "$api_paths_tmp" >> "$p8dir/js-endpoints.txt"
+                sed "s|^|$base|" "$api_paths_tmp" >> "$js_endpoints_tmp"
             done < "$p3dir_ref/live-hosts.txt"
         fi
         rm -f "$api_paths_tmp"
-        sort -u "$p8dir/js-endpoints.txt" -o "$p8dir/js-endpoints.txt"
     fi
+    # Atomic final dedupe + move
+    sort -u "$js_endpoints_tmp" -o "$js_endpoints_tmp"
+    mv "$js_endpoints_tmp" "$p8dir/js-endpoints.txt"
 
     if [ -s "$p8dir/js-endpoints.txt" ]; then
         httpx-toolkit -l "$p8dir/js-endpoints.txt" \
@@ -2320,6 +2372,15 @@ phase9_pattern_hunting() {
     info "Testing CORS misconfigurations (up to $MAX_CORS_HOSTS hosts)..."
     local cors_count=0
     local cors_failures=0
+    # BUG-7 FIX: Track a sliding window of the last N attempts so the throttle
+    # bail-out reflects RECENT failure rate, not cumulative.  A target that
+    # fails 5 requests then succeeds 50 should not trip this; the old check
+    # divided lifetime-failures by lifetime-attempts, which permanently
+    # poisoned the ratio on transient hiccups.  We use a fixed-size string
+    # buffer of '1' (fail) / '0' (ok) characters and recompute the rate
+    # against the window only.
+    local cors_window=""
+    local cors_window_size=20
     if [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
             local headers acao acac
@@ -2328,12 +2389,29 @@ phase9_pattern_hunting() {
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                 -I "$url" 2>/dev/null)
 
+            # Update sliding window — append result, trim to window_size
+            local _result
             if [ -z "$headers" ]; then
+                _result="1"
                 cors_failures=$(( cors_failures + 1 ))
-                # Bail early if >25% of requests are failing — likely throttled
-                if [ $cors_count -gt 10 ] && [ $((cors_failures * 100 / cors_count)) -gt 25 ]; then
-                    warn "CORS scan: ${cors_failures}/${cors_count} requests failed (>25%) — possible throttling. Stopping early."
-                    break
+            else
+                _result="0"
+            fi
+            cors_window="${cors_window}${_result}"
+            if [ "${#cors_window}" -gt "$cors_window_size" ]; then
+                cors_window="${cors_window:${#cors_window}-cors_window_size}"
+            fi
+
+            if [ -z "$headers" ]; then
+                # Bail early only after a full window of measurements AND >25%
+                # recent failure rate — avoids tripping on transient hiccups.
+                if [ "${#cors_window}" -eq "$cors_window_size" ]; then
+                    local _recent_fails
+                    _recent_fails=$(echo -n "$cors_window" | tr -cd '1' | wc -c)
+                    if [ $((_recent_fails * 100 / cors_window_size)) -gt 25 ]; then
+                        warn "CORS scan: ${_recent_fails}/${cors_window_size} recent requests failed (>25%) — possible throttling. Stopping early."
+                        break
+                    fi
                 fi
                 cors_count=$(( cors_count + 1 ))
                 continue
@@ -2342,9 +2420,22 @@ phase9_pattern_hunting() {
             acao=$(echo "$headers" | grep -i 'access-control-allow-origin' | tr -d '\r')
             acac=$(echo "$headers" | grep -i 'access-control-allow-credentials' | tr -d '\r')
 
-            if echo "$acao" | grep -qiE '(evil\.nullsec\.com|^null$)'; then
+            # BUG-6 FIX: $acao contains the full header line
+            # "Access-Control-Allow-Origin: null", so a regex anchored with
+            # ^null$ can never match.  Extract just the header VALUE (after
+            # the colon, whitespace-trimmed) for the null-origin and
+            # wildcard-with-credentials tests below.  The reflected-origin
+            # case still works on the full line because "evil.nullsec.com"
+            # appears as a substring either way.
+            local acao_value acac_value
+            acao_value=$(echo "$acao" | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//')
+            acac_value=$(echo "$acac" | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//')
+
+            if echo "$acao" | grep -qi 'evil\.nullsec\.com' \
+               || [ "$(echo "$acao_value" | tr '[:upper:]' '[:lower:]')" = "null" ]; then
                 echo "[CORS-CRITICAL] $url | $acao | $acac" >> "$p9dir/cors-findings.txt"
-            elif echo "$acao" | grep -q '\*' && echo "$acac" | grep -qi 'true'; then
+            elif [ "$acao_value" = "*" ] && \
+                 [ "$(echo "$acac_value" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
                 echo "[CORS-HIGH] $url | $acao | $acac" >> "$p9dir/cors-findings.txt"
             fi
             cors_count=$(( cors_count + 1 ))
@@ -2362,6 +2453,9 @@ phase9_pattern_hunting() {
     info "Testing for Host Header Injection..."
     local hhi_count=0
     local hhi_failures=0
+    # BUG-7 FIX: Sliding-window throttle detection (see CORS loop above).
+    local hhi_window=""
+    local hhi_window_size=10
     if [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $hhi_count -lt 30 ]; do
             local resp
@@ -2371,17 +2465,36 @@ phase9_pattern_hunting() {
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                 "$url" 2>/dev/null)
 
+            local _result
             if [ -z "$resp" ]; then
+                _result="1"
                 hhi_failures=$(( hhi_failures + 1 ))
-                if [ $hhi_count -gt 5 ] && [ $((hhi_failures * 100 / hhi_count)) -gt 25 ]; then
-                    warn "HHI scan: ${hhi_failures}/${hhi_count} requests failed (>25%) — possible throttling. Stopping early."
-                    break
+            else
+                _result="0"
+            fi
+            hhi_window="${hhi_window}${_result}"
+            if [ "${#hhi_window}" -gt "$hhi_window_size" ]; then
+                hhi_window="${hhi_window:${#hhi_window}-hhi_window_size}"
+            fi
+
+            if [ -z "$resp" ]; then
+                if [ "${#hhi_window}" -eq "$hhi_window_size" ]; then
+                    local _recent_fails
+                    _recent_fails=$(echo -n "$hhi_window" | tr -cd '1' | wc -c)
+                    if [ $((_recent_fails * 100 / hhi_window_size)) -gt 25 ]; then
+                        warn "HHI scan: ${_recent_fails}/${hhi_window_size} recent requests failed (>25%) — possible throttling. Stopping early."
+                        break
+                    fi
                 fi
                 hhi_count=$(( hhi_count + 1 ))
                 continue
             fi
 
-            if echo "$resp" | grep -q 'evil.nullsec.com'; then
+            # BUG-9 FIX: grep -F treats the pattern as a literal string so the
+            # dots in "evil.nullsec.com" are not interpreted as regex
+            # any-character wildcards (previous: `grep -q 'evil.nullsec.com'`
+            # would also match "evilXnullsecXcom" etc.).
+            if echo "$resp" | grep -qF 'evil.nullsec.com'; then
                 echo "[HOST-INJECTION] $url" >> "$p9dir/host-injection-findings.txt"
             fi
             hhi_count=$(( hhi_count + 1 ))
@@ -2503,6 +2616,12 @@ phase11_fuzzing() {
     local p3dir="$OUTPUT_DIR/phase3-probing"
     local p11dir="$OUTPUT_DIR/phase11-fuzzing"
 
+    # BUG-5 FIX: Back up prior-run output so SIGINT/SIGTERM during this phase
+    # can recover findings via the trap's merge_phase_backup call.  Without
+    # this, the trap's restore loop was a no-op for phase11-fuzzing.
+    local p11dir_backup="$p11dir"
+    backup_phase_outputs "$p11dir_backup"
+
     if ! check_command "ffuf"; then
         warn "ffuf not installed — skipping Phase 11."
         return
@@ -2584,6 +2703,9 @@ phase11_fuzzing() {
         success "Backup file scan complete"
     fi
 
+    # BUG-5 FIX: Merge any prior-run .bak files created by backup_phase_outputs
+    # at the top of this function.  Mirrors the pattern in phases 7, 8, 9, 12.
+    merge_phase_backup "$p11dir_backup"
     success "Phase 11 complete!"
 }
 
@@ -3007,11 +3129,17 @@ main() {
     _PARALLEL_PIDS=("${parallel_pids[@]}" "$_p9_watchdog" "$_p11_watchdog")
 
     # Wait for all parallel phase PIDs and record failures (BUG-8).
+    # BUG-2 FIX: `if ! wait "$pid"; then local exit_code=$?` reads $? from the
+    # negated conditional (always 0 inside the then-block), NOT from wait.  Call
+    # wait directly so $? captures the real exit status, including 143
+    # (128+SIGTERM) which means the watchdog killed the phase on wall-clock
+    # timeout.  Without this fix, the timeout-detection branch was dead code.
     local phase_failed=false
     for pid in "${parallel_pids[@]}"; do
-        if ! wait "$pid" 2>/dev/null; then
-            local exit_code=$?
-            if [ $exit_code -eq 143 ]; then
+        wait "$pid" 2>/dev/null
+        local exit_code=$?
+        if [ "$exit_code" -ne 0 ]; then
+            if [ "$exit_code" -eq 143 ]; then
                 # 143 = 128+SIGTERM — killed by watchdog timeout
                 warn "A parallel phase (PID $pid) was stopped by its wall-clock timeout — partial results preserved."
             else
