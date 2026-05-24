@@ -261,6 +261,46 @@ count_lines() {
     fi
 }
 
+# In-scope filter — given a stream of hosts or URLs on stdin, emit only those
+# whose hostname is the TARGET apex or a subdomain of it.  Prevents scanning
+# of third-party CDN / ad / analytics hosts (jsdelivr, googlesyndication,
+# facebook, googletagmanager, etc.) that show up in URL gathering but are
+# out-of-scope for any bug-bounty engagement against TARGET.
+#
+# Accepts both bare hostnames ("foo.example.com") and URLs
+# ("https://foo.example.com/bar"); extracts the hostname portion before
+# matching.  Match is case-insensitive and anchored: must end with
+# ".TARGET" or equal TARGET exactly.
+#
+# Usage:
+#   cat all-urls.txt | in_scope > in-scope-urls.txt
+#   in_scope < hosts.txt
+in_scope() {
+    # Empty TARGET would match everything via a "" suffix; refuse to filter
+    # rather than silently pass-through.
+    if [ -z "${TARGET:-}" ]; then
+        warn "in_scope: TARGET is unset — refusing to filter (pass-through disabled)"
+        return 1
+    fi
+    awk -v target="$TARGET" '
+        BEGIN { tlow = tolower(target) }
+        {
+            line = $0
+            host = line
+            # Strip scheme if present
+            sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", host)
+            # Strip path / query / fragment
+            sub(/[\/?#].*$/, "", host)
+            # Strip userinfo
+            sub(/^[^@]+@/, "", host)
+            # Strip port
+            sub(/:[0-9]+$/, "", host)
+            hlow = tolower(host)
+            if (hlow == tlow || hlow ~ ("\\." tlow "$")) print line
+        }
+    '
+}
+
 # Optional sleep between phases when -r flag is used
 polite_sleep() {
     if [ "$RATE_LIMIT" = true ]; then
@@ -1249,9 +1289,15 @@ phase3_probing() {
     # Resolves target to IP, then fuzzes Host header against the IP so we find
     # vhosts that DON'T have their own DNS records (the whole point — Phase 1
     # already covers subdomains that resolve via DNS).
-    if [ "$RUN_VHOST_DISCOVERY" = true ] && check_command "ffuf" && [ -f "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ]; then
+    # GATING FIX: changed `-f` to `-s` so an empty/truncated wordlist file is
+    # caught here rather than at ffuf parse time (which would dump help to stdout).
+    if [ "$RUN_VHOST_DISCOVERY" = true ] && check_command "ffuf" \
+       && [ -s "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ] \
+       && [ -r "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ]; then
         info "Running virtual host discovery via Host header injection (top 5 live hosts)..."
         local vhost_count=0
+        local vhost_ffuf_log="$p3dir/.vhost-ffuf-errors.log"
+        : > "$vhost_ffuf_log"
         while IFS= read -r host && [ $vhost_count -lt 5 ]; do
             local safe_name scheme hostname target_ip
             safe_name=$(echo "$host" | tr '/:' '__')
@@ -1268,6 +1314,9 @@ phase3_probing() {
             fi
 
             info "  Vhost fuzzing: $hostname ($target_ip)"
+            # STDOUT FIX: ffuf writes help/usage to stdout on argument
+            # rejection.  Route stdout to /dev/null and capture stderr to a
+            # log file for postmortem rather than only suppressing stderr.
             ffuf -u "${scheme}://${target_ip}/" \
                 -H "Host: FUZZ.$TARGET" \
                 -w "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" \
@@ -1278,10 +1327,13 @@ phase3_probing() {
                 -of json \
                 -fs 0 \
                 -ac \
-                -s 2>/dev/null
+                -s >/dev/null 2>>"$vhost_ffuf_log"
             vhost_count=$(( vhost_count + 1 ))
         done < "$p3dir/status-200.txt"
         success "Virtual host discovery complete ($vhost_count hosts checked)"
+        if [ -s "$vhost_ffuf_log" ]; then
+            info "vhost ffuf stderr preserved at: $vhost_ffuf_log"
+        fi
     fi
 
     success "Phase 3 complete!"
@@ -1864,6 +1916,46 @@ phase7_vulnerability_scanning() {
         success "Nuclei templates updated."
     fi
 
+    # UNSIGNED-TEMPLATE ADVISORY: nuclei emits
+    #     [WRN] Loading N unsigned templates for scan. Use with caution.
+    # at scan start whenever the template directory contains any .yaml that
+    # isn't covered by the official signing key (custom templates, forks,
+    # locally modified files).  The warning is informational from nuclei's
+    # side — it loaded them anyway — but represents a real trust decision the
+    # operator should make consciously.  We surface a one-time inventory so
+    # Jonaski can audit which templates are unsigned and decide whether to
+    # keep them.  Inventory is best-effort and won't fail the phase.
+    local _nt_dir
+    _nt_dir=$(nuclei -td 2>/dev/null | head -1)
+    if [ -z "$_nt_dir" ] || [ ! -d "$_nt_dir" ]; then
+        # Fall back to the common default location
+        _nt_dir="$HOME/nuclei-templates"
+    fi
+    if [ -d "$_nt_dir" ]; then
+        # A template is considered "potentially unsigned" if it lives outside
+        # the official numbered version directory and lacks the standard
+        # "# digest:" signature footer that nuclei-templates ship with.
+        # This is heuristic — nuclei's own verifier is authoritative — but
+        # gives the operator a list to inspect.
+        local _unsigned_list="$p7dir/.unsigned-templates.txt"
+        find "$_nt_dir" -type f -name '*.yaml' -not -path '*/\.*' 2>/dev/null \
+            | while IFS= read -r _tpl; do
+                if ! grep -q '^# digest:' "$_tpl" 2>/dev/null; then
+                    printf '%s\n' "$_tpl"
+                fi
+              done > "$_unsigned_list" 2>/dev/null
+        local _unsigned_count
+        _unsigned_count=$(count_lines "$_unsigned_list")
+        if [ "$_unsigned_count" -gt 0 ]; then
+            warn "Nuclei template inventory: $_unsigned_count potentially unsigned template(s) detected."
+            warn "  These will trigger '[WRN] Loading N unsigned templates' from nuclei."
+            warn "  Audit with: cat $_unsigned_list"
+            warn "  If any are not yours, remove with: while read t; do rm -i \"\$t\"; done < $_unsigned_list"
+        else
+            rm -f "$_unsigned_list"
+        fi
+    fi
+
     # ── Build partitioned target lists ──────────────────────────────────────
     #
     # BUG-1/3 FIX: Previously a single flat list mixed live hosts with JS file
@@ -1881,18 +1973,48 @@ phase7_vulnerability_scanning() {
     local host_targets="$p7dir/.host-targets.txt"
     local combined_targets="$p7dir/.combined-targets.txt"
 
-    # Host-level list: live roots only
-    sort -u "$p3dir/live-hosts.txt" > "$host_targets" 2>/dev/null
+    # SCOPE FIX: Filter all target lists through in_scope so third-party CDN /
+    # ad / analytics hosts (jsdelivr, googlesyndication, facebook,
+    # googletagmanager, etc.) that leaked in via Phase 5 URL gathering are
+    # excluded.  Scanning third-party infrastructure is out-of-scope for any
+    # bug-bounty engagement against TARGET and can violate program rules,
+    # provider ToS, or local computer-misuse statutes.
 
-    # Combined list: roots + URL feeds (for path-aware exposure templates)
+    # Host-level list: live roots only, scope-filtered
+    in_scope < "$p3dir/live-hosts.txt" 2>/dev/null | sort -u > "$host_targets"
+
+    # Combined list: roots + URL feeds (for path-aware exposure templates),
+    # scope-filtered before dedup.
     {
         cat "$p3dir/live-hosts.txt"
         [ -s "$p5dir/sensitive-endpoints.txt" ] && cat "$p5dir/sensitive-endpoints.txt"
         [ -s "$p5dir/live-js-files.txt" ]       && cat "$p5dir/live-js-files.txt"
         [ -s "$p5dir/api-endpoints.txt" ]        && cat "$p5dir/api-endpoints.txt"
-    } 2>/dev/null | sort -u > "$combined_targets"
+    } 2>/dev/null | in_scope | sort -u > "$combined_targets"
+
+    # Report dropped count for visibility — helps confirm scope filter is
+    # doing its job (or flag a misconfigured TARGET if everything is dropped).
+    local _raw_host_count _raw_url_count _dropped_hosts _dropped_urls
+    _raw_host_count=$(count_lines "$p3dir/live-hosts.txt")
+    _raw_url_count=$( { cat "$p3dir/live-hosts.txt" \
+        ${p5dir:+"$p5dir/sensitive-endpoints.txt"} \
+        ${p5dir:+"$p5dir/live-js-files.txt"} \
+        ${p5dir:+"$p5dir/api-endpoints.txt"} 2>/dev/null \
+        | sort -u | wc -l; } || echo 0)
+    _dropped_hosts=$(( _raw_host_count - $(count_lines "$host_targets") ))
+    _dropped_urls=$((  _raw_url_count  - $(count_lines "$combined_targets") ))
 
     info "Target lists — hosts: $(count_lines "$host_targets")  URLs: $(count_lines "$combined_targets")"
+    if [ "$_dropped_hosts" -gt 0 ] || [ "$_dropped_urls" -gt 0 ]; then
+        info "Scope filter dropped $_dropped_hosts out-of-scope host(s) and $_dropped_urls out-of-scope URL(s)."
+    fi
+
+    if [ ! -s "$host_targets" ]; then
+        warn "All live hosts were filtered out as out-of-scope for TARGET=$TARGET. Skipping Phase 7."
+        save_checkpoint 7
+        polite_sleep
+        return
+    fi
 
     # 7.1 Consolidated severity scan against host roots only
     # BUG-2 FIX: -stats gives per-template progress so long runs don't appear
@@ -2014,11 +2136,48 @@ phase7_vulnerability_scanning() {
     rm -f "$host_targets" "$combined_targets"
 
     # 7.4 Tally all findings
-    # BUG-5a FIX: `jq -s 'length'` on a JSON array slurps the array into a
-    # wrapper array → always returns 1, never the real finding count.
-    # `jq 'length'` on a JSON array returns the element count directly.
-    local total_findings
-    total_findings=$(jq 'length' "$p7dir/all-findings.json" 2>/dev/null || echo "0")
+    # COUNT FIX: the previous form
+    #     total_findings=$(jq 'length' all-findings.json 2>/dev/null || echo "0")
+    # silently substituted "0" for any jq failure — missing file, malformed
+    # JSON (e.g. nuclei killed mid-flush), empty file, jq absent, etc.  This
+    # produced "Total findings: 0" runs even when scan1-nuclei.log clearly
+    # showed dozens of matches.  We now:
+    #   1. Check that the JSON file exists and is non-empty before invoking jq;
+    #   2. Capture both jq's exit status and a separate text-file fallback;
+    #   3. Warn loudly when the two counts disagree (a signal that the JSON
+    #      export failed and findings exist only in the .txt output).
+    local total_findings=0
+    local text_findings
+    text_findings=$(count_lines "$p7dir/all-findings.txt")
+
+    if [ ! -s "$p7dir/all-findings.json" ]; then
+        # JSON not produced — fall back to text count.  This commonly means
+        # nuclei was killed by a signal before flushing JSON, or the template
+        # set hit zero matches (in which case text_findings will also be 0).
+        if [ "$text_findings" -gt 0 ]; then
+            warn "all-findings.json missing or empty but all-findings.txt has $text_findings matches — JSON export failed."
+            warn "Findings are preserved in $p7dir/all-findings.txt; downstream category split was skipped."
+            total_findings="$text_findings"
+        fi
+    else
+        local _jq_err
+        _jq_err=$(mktemp)
+        total_findings=$(jq 'length' "$p7dir/all-findings.json" 2>"$_jq_err")
+        local _jq_exit=$?
+        if [ "$_jq_exit" -ne 0 ] || ! [[ "$total_findings" =~ ^[0-9]+$ ]]; then
+            warn "jq failed to parse all-findings.json (exit $_jq_exit). Falling back to text-line count."
+            [ -s "$_jq_err" ] && warn "  jq stderr: $(head -1 "$_jq_err")"
+            total_findings="$text_findings"
+        elif [ "$total_findings" -eq 0 ] && [ "$text_findings" -gt 0 ]; then
+            # JSON parsed as empty array but text file has lines — schema
+            # mismatch (nuclei version change) or path mismatch.
+            warn "JSON reports 0 findings but all-findings.txt has $text_findings — possible export/version mismatch."
+            warn "  Trusting text count; manually inspect $p7dir/all-findings.json"
+            total_findings="$text_findings"
+        fi
+        rm -f "$_jq_err"
+    fi
+
     local exposure_count
     exposure_count=$(count_lines "$p7dir/exposure-findings.txt")
 
@@ -2627,8 +2786,13 @@ phase11_fuzzing() {
         return
     fi
 
-    if [ ! -f "$WEB_WORDLIST" ]; then
-        warn "Web wordlist not found at $WEB_WORDLIST — skipping directory fuzzing."
+    # GATING FIX: previously used `[ ! -f ... ]` which only checks existence.
+    # An empty or unreadable wordlist would pass the gate and ffuf would reject
+    # `-w` at parse time, dumping its help block to STDOUT (see stdout
+    # redirect note below).  `-s` requires the file to exist AND be non-empty.
+    # `-r` adds the readability check.
+    if [ ! -s "$WEB_WORDLIST" ] || [ ! -r "$WEB_WORDLIST" ]; then
+        warn "Web wordlist missing/empty/unreadable at $WEB_WORDLIST — skipping directory fuzzing."
         return
     fi
 
@@ -2637,8 +2801,31 @@ phase11_fuzzing() {
         return
     fi
 
+    # SCOPE FIX: status-200 hosts come from Phase 3 probing of every URL
+    # discovered in Phase 5, which includes third-party CDN / ad / analytics
+    # hosts.  Filter to in-scope only before feeding ffuf so we don't fuzz
+    # someone else's infrastructure.
+    local fuzz_input="$p11dir/.fuzz-targets-in-scope.txt"
+    in_scope < "$p3dir/status-200.txt" 2>/dev/null | sort -u > "$fuzz_input"
+    if [ ! -s "$fuzz_input" ]; then
+        warn "No in-scope status-200 hosts for fuzzing (TARGET=$TARGET) — skipping."
+        rm -f "$fuzz_input"
+        return
+    fi
+
+    # STDOUT FIX: ffuf writes its usage/help block and several argument-
+    # rejection errors to STDOUT, not stderr.  The original code only
+    # redirected stderr (`2>/dev/null`), so any argument-parsing failure
+    # leaked the entire ffuf help text into the run log — appearing under
+    # whichever sibling parallel phase (8/9/10) happened to log next.
+    # We now route stdout to /dev/null and stderr to a per-host log file so
+    # real ffuf errors (network, calibration, timeout) are preserved for
+    # postmortem without polluting the live terminal.
+    local ffuf_log="$p11dir/.ffuf-errors.log"
+    : > "$ffuf_log"
+
     # 11.1 Directory brute-force with smart auto-calibration (-ac)
-    info "Running recursive directory fuzzing on top 10 live hosts..."
+    info "Running recursive directory fuzzing on top 10 in-scope live hosts..."
     local fuzz_count=0
     while IFS= read -r url && [ $fuzz_count -lt 10 ]; do
         local safe_name
@@ -2655,7 +2842,7 @@ phase11_fuzzing() {
             -recursion -recursion-depth 2 \
             -ac \
             -timeout 10 \
-            -silent 2>/dev/null &
+            -silent >/dev/null 2>>"$ffuf_log" &
         local ffuf_pid=$!
         # Per-host wall-clock cap prevents a single slow host from blocking the loop
         ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_pid" 2>/dev/null ) &
@@ -2670,12 +2857,14 @@ phase11_fuzzing() {
             >> "$p11dir/dirs/all-found-paths.txt"
 
         fuzz_count=$(( fuzz_count + 1 ))
-    done < "$p3dir/status-200.txt"
+    done < "$fuzz_input"
 
     success "Directory fuzzing complete: $(count_lines "$p11dir/dirs/all-found-paths.txt") paths found"
 
     # 11.2 Backup & config file discovery
-    if [ -f "$SECLISTS/Discovery/Web-Content/raft-large-files.txt" ]; then
+    # GATING FIX: same as above — `-s` not `-f` to catch empty wordlists.
+    if [ -s "$SECLISTS/Discovery/Web-Content/raft-large-files.txt" ] \
+       && [ -r "$SECLISTS/Discovery/Web-Content/raft-large-files.txt" ]; then
         info "Scanning for exposed backup and config files..."
         local backup_count=0
         while IFS= read -r url && [ $backup_count -lt 5 ]; do
@@ -2690,7 +2879,7 @@ phase11_fuzzing() {
                 -of json \
                 -ac \
                 -timeout 10 \
-                -silent 2>/dev/null &
+                -silent >/dev/null 2>>"$ffuf_log" &
             local ffuf_bak_pid=$!
             ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_bak_pid" 2>/dev/null ) &
             local watchdog_bak_pid=$!
@@ -2699,9 +2888,22 @@ phase11_fuzzing() {
             fi
             kill -TERM "$watchdog_bak_pid" 2>/dev/null; wait "$watchdog_bak_pid" 2>/dev/null || true
             backup_count=$(( backup_count + 1 ))
-        done < "$p3dir/status-200.txt"
+        done < "$fuzz_input"
         success "Backup file scan complete"
     fi
+
+    # Surface any ffuf errors that were captured during the phase so they're
+    # not silently lost.  Cap to last 20 lines to avoid log spam.
+    if [ -s "$ffuf_log" ]; then
+        local _err_count
+        _err_count=$(wc -l < "$ffuf_log")
+        warn "ffuf wrote $_err_count line(s) to stderr during Phase 11. Tail (last 20):"
+        tail -20 "$ffuf_log" | while IFS= read -r line; do warn "  → $line"; done
+        info "Full ffuf stderr preserved at: $ffuf_log"
+    fi
+
+    # Clean up the in-scope target file (kept the ffuf_log for postmortem).
+    rm -f "$fuzz_input"
 
     # BUG-5 FIX: Merge any prior-run .bak files created by backup_phase_outputs
     # at the top of this function.  Mirrors the pattern in phases 7, 8, 9, 12.
