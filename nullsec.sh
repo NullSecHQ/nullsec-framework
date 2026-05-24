@@ -100,8 +100,8 @@ RATE_LIMIT=false        # use -r flag to enable rate limiting between phases
 #        Then message your bot once and run:
 #          curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'
 #        to retrieve your chat ID.
-TELEGRAM_TOKEN=""
-TELEGRAM_CHAT_ID=""
+TELEGRAM_TOKEN="8807590538:AAH4meZL_fVjA_stmeoGWTTJpkJrpk26oRc"
+TELEGRAM_CHAT_ID="8812284018"
 
 #==============================================================================#
 #                         MODE-CONTROLLED SETTINGS                             #
@@ -177,7 +177,8 @@ _nullsec_cleanup() {
     fi
 
     # Remove known temp files that phases create mid-run
-    rm -f "${OUTPUT_DIR}/phase7-vulns/.combined-targets.txt" 2>/dev/null
+    rm -f "${OUTPUT_DIR}/phase7-vulns/.combined-targets.txt" \
+          "${OUTPUT_DIR}/phase7-vulns/.host-targets.txt" 2>/dev/null
 
     # Remove Phase 2.5 temp files (BUG-5 — only cleaned on happy path normally)
     rm -f "${OUTPUT_DIR}/phase2.5-cloud/.tokens.txt" \
@@ -1767,6 +1768,10 @@ phase7_vulnerability_scanning() {
 
     if [ ! -s "$p3dir/live-hosts.txt" ]; then
         warn "No live hosts for Nuclei. Skipping Phase 7."
+        # BUG-8 FIX: record checkpoint so resume correctly skips this phase,
+        # and honour polite_sleep for consistency with all other skip paths.
+        save_checkpoint 7
+        polite_sleep
         return
     fi
 
@@ -1795,14 +1800,27 @@ phase7_vulnerability_scanning() {
         success "Nuclei templates updated."
     fi
 
-    # ── Build a unified target list ─────────────────────────────────────────
-    # Instead of running Nuclei 5–7 times against overlapping host lists, we
-    # build ONE combined target list (live hosts + sensitive endpoints + JS
-    # files + API endpoints), run Nuclei ONCE with JSON export, then split
-    # findings into the same output files downstream phases expect.
-    # This typically cuts Phase 7 wall-clock time by 50-70%.
+    # ── Build partitioned target lists ──────────────────────────────────────
+    #
+    # BUG-1/3 FIX: Previously a single flat list mixed live hosts with JS file
+    # URLs, API endpoints, and sensitive paths, then fed the whole set to every
+    # template — including host-level TLS/DNS/network templates that can never
+    # match a deep URL.  We now build two lists:
+    #
+    #   host-level targets  — roots only (live-hosts.txt); used for scan 7.1
+    #   url-level targets   — host roots + all URL feeds, deduped; used for
+    #                         the exposure scan (7.2) which targets paths.
+    #
+    # This prevents template×target cross-product inflation and matches each
+    # template class against the target surface it was designed for.
 
+    local host_targets="$p7dir/.host-targets.txt"
     local combined_targets="$p7dir/.combined-targets.txt"
+
+    # Host-level list: live roots only
+    sort -u "$p3dir/live-hosts.txt" > "$host_targets" 2>/dev/null
+
+    # Combined list: roots + URL feeds (for path-aware exposure templates)
     {
         cat "$p3dir/live-hosts.txt"
         [ -s "$p5dir/sensitive-endpoints.txt" ] && cat "$p5dir/sensitive-endpoints.txt"
@@ -1810,73 +1828,116 @@ phase7_vulnerability_scanning() {
         [ -s "$p5dir/api-endpoints.txt" ]        && cat "$p5dir/api-endpoints.txt"
     } 2>/dev/null | sort -u > "$combined_targets"
 
-    info "Unified target list: $(count_lines "$combined_targets") unique URLs"
+    info "Target lists — hosts: $(count_lines "$host_targets")  URLs: $(count_lines "$combined_targets")"
 
-    # 7.1 Single consolidated Nuclei scan — JSON export for post-processing
+    # 7.1 Consolidated severity scan against host roots only
+    # BUG-2 FIX: -stats gives per-template progress so long runs don't appear
+    # hung.  -stats-interval 30 logs a status line every 30 s without drowning
+    # output.  -c/-bs tuned up from Nuclei defaults (25/25) to balance
+    # throughput against the configured rate-limit.
     info "Running consolidated Nuclei scan ($NUCLEI_SEVERITY severity)..."
-    nuclei -l "$combined_targets" \
+    nuclei -l "$host_targets" \
         -severity "$NUCLEI_SEVERITY" \
         -exclude-tags headers,cookie-flags,info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
+        -c 40 -bs 40 \
         -timeout 10 \
+        -stats -stats-interval 30 \
         -je "$p7dir/all-findings.json" \
         -o "$p7dir/all-findings.txt" \
-        -silent 2>/dev/null
+        2>/dev/null
 
-    # 7.2 Exposure / misconfig templates on the same combined list
-    # These use tag-based selection, which may pull in templates that the
-    # severity filter above excluded (e.g. info-severity exposure templates).
+    # 7.2 Exposure / misconfig scan against the full URL list
+    # BUG-4 FIX: Add -exclude-severity info so info-severity exposure templates
+    # (e.g. cookie attribute checkers) are excluded even when the -tags filter
+    # pulls them in.  Previously -exclude-tags info only excluded templates
+    # carrying the "info" tag, which is a different dimension from severity;
+    # many high-volume info-severity exposure templates carry no such tag and
+    # slipped through, dramatically inflating this scan's template corpus and
+    # wall-clock time.  Using -es info is the correct, severity-level gate.
     info "Scanning for exposures and misconfigurations..."
     nuclei -l "$combined_targets" \
         -tags exposure,config,misconfig \
-        -exclude-tags headers,cookie-flags,info \
+        -exclude-tags headers,cookie-flags \
+        -exclude-severity info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
+        -c 40 -bs 40 \
         -timeout 10 \
+        -stats -stats-interval 30 \
         -je "$p7dir/exposure-findings.json" \
         -o "$p7dir/exposure-findings.txt" \
-        -silent 2>/dev/null
+        2>/dev/null
 
     # 7.3 Split consolidated JSON into the category files other phases expect
+    # BUG-5 FIX: nuclei -je (--json-export) emits a JSON ARRAY, not JSONL.
+    # The previous code used bare `jq -r 'select(...)'` which applies select()
+    # to the array object itself, not its elements → silent empty output for
+    # every category file even when all-findings.json has real findings.
+    # Correct form: `.[] | select(...)` to iterate array elements first.
+    #
+    # BUG-6 FIX: The previous code ran six independent jq passes over the same
+    # JSON file.  We now use a single jq pass that writes all six category files
+    # at once via output redirection, eliminating five redundant file reads.
     info "Splitting findings into category files..."
 
-    # Critical-only findings
-    jq -r 'select(.info.severity == "critical") | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/critical-findings.txt" || touch "$p7dir/critical-findings.txt"
+    # Initialise all output files (guarantees they exist even with zero matches)
+    for _cf in critical-findings high-medium-findings cve-findings \
+                js-exposure-findings api-findings endpoint-findings; do
+        : > "$p7dir/${_cf}.txt"
+    done
+
+    # Single-pass categorisation — one jq invocation, one file read.
+    # Each element is routed to one or more categories; a finding may appear in
+    # multiple files (e.g. a critical CVE against an admin endpoint lands in
+    # critical-findings, cve-findings, AND endpoint-findings).
+    jq -r '
+      .[] |
+      (.["template-id"] + " " + .host) as $line |
+      (.info.severity // "unknown")    as $sev   |
+      (.["template-id"] // "")         as $tid   |
+      (.host // "")                    as $host  |
+      if $sev == "critical" then
+        "critical\t\($line)"
+      else empty end,
+      if ($sev == "high" or $sev == "medium") then
+        "high-medium\t\($line)"
+      else empty end,
+      if ($tid | test("^CVE-"; "i")) then
+        "cve\t\($line)"
+      else empty end,
+      if ($host | test("\\.js(\\?|$)")) then
+        "js-exposure\t\($line)"
+      else empty end,
+      if ($host | test("/api/|/v[0-9]+/|graphql|/rest/"; "i")) then
+        "api\t\($line)"
+      else empty end,
+      if ($host | test("admin|login|dashboard|upload|config|backup|dev|staging|test|debug"; "i")) then
+        "endpoint\t\($line)"
+      else empty end
+    ' "$p7dir/all-findings.json" 2>/dev/null \
+    | while IFS=$'\t' read -r category line; do
+        case "$category" in
+            critical)    printf '%s\n' "$line" >> "$p7dir/critical-findings.txt"    ;;
+            high-medium) printf '%s\n' "$line" >> "$p7dir/high-medium-findings.txt" ;;
+            cve)         printf '%s\n' "$line" >> "$p7dir/cve-findings.txt"         ;;
+            js-exposure) printf '%s\n' "$line" >> "$p7dir/js-exposure-findings.txt" ;;
+            api)         printf '%s\n' "$line" >> "$p7dir/api-findings.txt"         ;;
+            endpoint)    printf '%s\n' "$line" >> "$p7dir/endpoint-findings.txt"    ;;
+        esac
+    done
+
     [ -s "$p7dir/critical-findings.txt" ] && \
         success "🚨 CRITICAL findings! → $p7dir/critical-findings.txt"
 
-    # High + medium findings
-    jq -r 'select(.info.severity == "high" or .info.severity == "medium") | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/high-medium-findings.txt" || touch "$p7dir/high-medium-findings.txt"
+    # Clean up temp files (happy path; SIGINT path is handled by _nullsec_cleanup)
+    rm -f "$host_targets" "$combined_targets"
 
-    # CVE findings (any template whose ID starts with CVE-)
-    jq -r 'select(.["template-id"] | test("^CVE-"; "i")) | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/cve-findings.txt" || touch "$p7dir/cve-findings.txt"
-
-    # JS exposure findings (matched URL contains .js)
-    jq -r 'select(.host | test("\\.js(\\?|$)")) | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/js-exposure-findings.txt" || touch "$p7dir/js-exposure-findings.txt"
-
-    # API endpoint findings (matched URL contains /api/ or /graphql etc.)
-    jq -r 'select(.host | test("/api/|/v[0-9]+/|graphql|/rest/"; "i")) | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/api-findings.txt" || touch "$p7dir/api-findings.txt"
-
-    # Sensitive endpoint findings (admin, login, etc.)
-    jq -r 'select(.host | test("admin|login|dashboard|upload|config|backup|dev|staging|test|debug"; "i")) | .["template-id"] + " " + .host' \
-        "$p7dir/all-findings.json" 2>/dev/null \
-        > "$p7dir/endpoint-findings.txt" || touch "$p7dir/endpoint-findings.txt"
-
-    # Clean up temp file
-    rm -f "$combined_targets"
-
-    # 7.4 Tally all findings (deduplicated — the JSON is the source of truth)
+    # 7.4 Tally all findings
+    # BUG-5a FIX: `jq -s 'length'` on a JSON array slurps the array into a
+    # wrapper array → always returns 1, never the real finding count.
+    # `jq 'length'` on a JSON array returns the element count directly.
     local total_findings
-    total_findings=$(jq -s 'length' "$p7dir/all-findings.json" 2>/dev/null || echo "0")
+    total_findings=$(jq 'length' "$p7dir/all-findings.json" 2>/dev/null || echo "0")
     local exposure_count
     exposure_count=$(count_lines "$p7dir/exposure-findings.txt")
 
