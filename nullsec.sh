@@ -100,8 +100,8 @@ RATE_LIMIT=false        # use -r flag to enable rate limiting between phases
 #        Then message your bot once and run:
 #          curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'
 #        to retrieve your chat ID.
-TELEGRAM_TOKEN="8807590538:AAH4meZL_fVjA_stmeoGWTTJpkJrpk26oRc"
-TELEGRAM_CHAT_ID="8812284018"
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
 
 #==============================================================================#
 #                         MODE-CONTROLLED SETTINGS                             #
