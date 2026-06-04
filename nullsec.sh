@@ -2155,11 +2155,27 @@ phase7_vulnerability_scanning() {
     # doing its job (or flag a misconfigured TARGET if everything is dropped).
     local _raw_host_count _raw_url_count _dropped_hosts _dropped_urls
     _raw_host_count=$(count_lines "$p3dir/live-hosts.txt")
-    _raw_url_count=$( { cat "$p3dir/live-hosts.txt" \
-        ${p5dir:+"$p5dir/sensitive-endpoints.txt"} \
-        ${p5dir:+"$p5dir/live-js-files.txt"} \
-        ${p5dir:+"$p5dir/api-endpoints.txt"} 2>/dev/null \
-        | sort -u | wc -l; } || echo 0)
+    # Guard each optional file with [ -s ] (mirroring the combined_targets block
+    # above) so a missing Phase 5 category file cannot make `cat` fail.  The
+    # previous version appended the path unconditionally via ${p5dir:+...} and
+    # relied on `|| echo 0`, which — when cat failed on an absent file — printed
+    # wc's count AND an extra "0" on a second line.  The multi-line value then
+    # broke the $(( ... )) arithmetic on the next lines:
+    #   line: 9\n0: syntax error in expression (error token is "0")
+    # Phase 5 refinement (5.6b) can now legitimately yield empty/absent category
+    # files, which is why this began crashing.  Build the count from a guarded
+    # group with a single, deterministic output.
+    _raw_url_count=$( {
+        cat "$p3dir/live-hosts.txt"
+        [ -s "$p5dir/sensitive-endpoints.txt" ] && cat "$p5dir/sensitive-endpoints.txt"
+        [ -s "$p5dir/live-js-files.txt" ]       && cat "$p5dir/live-js-files.txt"
+        [ -s "$p5dir/api-endpoints.txt" ]        && cat "$p5dir/api-endpoints.txt"
+    } 2>/dev/null | sort -u | wc -l)
+    # Coerce to a single integer token as belt-and-suspenders against any
+    # whitespace/newline creeping into the arithmetic operands.
+    _raw_host_count=${_raw_host_count//[!0-9]/}
+    _raw_url_count=${_raw_url_count//[!0-9]/}
+    : "${_raw_host_count:=0}" "${_raw_url_count:=0}"
     _dropped_hosts=$(( _raw_host_count - $(count_lines "$host_targets") ))
     _dropped_urls=$((  _raw_url_count  - $(count_lines "$combined_targets") ))
 
