@@ -195,6 +195,10 @@ _nullsec_cleanup() {
     rm -rf "${OUTPUT_DIR}/asset-scoring/.tmp" \
            "${OUTPUT_DIR}/asset-scoring/.host-universe.txt" 2>/dev/null
 
+    # Remove Phase 5 corpus-refinement intermediates (5.6b)
+    rm -f "${OUTPUT_DIR}/phase5-urls/.urls-scoped.txt" \
+          "${OUTPUT_DIR}/phase5-urls/.urls-collapsed.txt" 2>/dev/null
+
     # Merge any in-flight .bak files so prior-run findings are not lost.
     # Children have already exited above, so this is now race-free.
     for phase_dir in \
@@ -1025,65 +1029,142 @@ phase2_5_cloud_enum() {
     local gcs_writable="$cdir/gcs/writable.txt"
     touch "$gcs_exists" "$gcs_readable" "$gcs_writable"
 
+    # GCS readable/writable now require a TRUE anonymous-listing signal plus an
+    # ownership-corroboration check.  Rationale (false-positive fix):
+    #
+    #   GCS bucket names live in ONE flat global namespace.  A bare HTTP 200 on
+    #   storage.googleapis.com/<name> only proves *somebody* owns <name> — never
+    #   that the target does.  High-collision tokens like "media", "assets",
+    #   "static", "api-media" are squatted worldwide, so the old "200 ⇒ readable
+    #   target bucket" logic produced findings on strangers' infrastructure.
+    #
+    #   New gating, in order:
+    #     1. EXISTS  — bucket resolves (200/401/403 from the JSON bucket-get).
+    #     2. READABLE — the anonymous Objects:list JSON API returns an `items`
+    #        array (i.e. anonymous object enumeration genuinely works).  A 200 on
+    #        the XML root alone is NOT sufficient.
+    #     3. OWNERSHIP — the bucket name must be corroborated as target-related:
+    #        either it equals/contains the base company token, OR at least one
+    #        listed object/path ties back to the target.  Buckets that pass (1)+(2)
+    #        but fail (3) are quarantined to gcs/unverified.txt, never promoted to
+    #        readable/exposed/report/Telegram.
+    #     4. WRITABLE — only evaluated for buckets that already passed (1)+(2)+(3).
+    #        Read-only IAM-policy inference ONLY (a GET of the public IAM policy);
+    #        the framework never issues a write/PUT against any bucket.
+    #
+    # $5 is the lowercase base company token used for the ownership heuristic.
     _check_gcs_bucket() {
         local name="$1"
         local gcs_exists="$2" gcs_readable="$3" gcs_writable="$4"
+        local base_tok="$5"
+        local gcs_unverified="${gcs_readable%/*}/unverified.txt"
         local gcs_url="https://storage.googleapis.com/${name}"
-        local rc
-        rc=$(curl -sk --max-time 8 -o /dev/null -w "%{http_code}" "$gcs_url")
 
-        case "$rc" in
-            200)
-                echo "$gcs_url" >> "$gcs_exists"
-                echo "$gcs_url" >> "$gcs_readable"
-                # BUG-3 FIX: Check IAM for allUsers with a WRITE-capable role.
-                #
-                #   roles/storage.objectCreator    — create/overwrite objects
-                #   roles/storage.objectAdmin      — full object control
-                #   roles/storage.legacyBucketWriter — ACL-based write
-                #   roles/storage.admin            — full bucket control
-                #
-                # Previous version used two independent grep -q calls over the
-                # whole JSON response, so `allUsers` in a READ binding plus a
-                # write role granted to any OTHER principal in a separate
-                # binding would falsely classify the bucket as writable.  Fix:
-                # parse the IAM bindings with jq and require that `allUsers`
-                # appears as a member of a binding whose role is write-capable.
-                # Falls back to the old (less precise) grep when jq is missing
-                # — better to over-report than to silently skip the check.
-                local acl_resp
-                acl_resp=$(curl -sk --max-time 5 \
-                    "https://www.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null)
-                if command -v jq >/dev/null 2>&1; then
-                    if echo "$acl_resp" | jq -e '
-                        .bindings[]?
-                        | select(.role | test("(objectCreator|objectAdmin|legacyBucketWriter|storage\\.admin)"))
-                        | .members[]?
-                        | select(. == "allUsers")
-                    ' >/dev/null 2>&1; then
-                        echo "$gcs_url" >> "$gcs_writable"
-                    fi
-                else
-                    # Fallback (less precise): require both substrings, mark as
-                    # suspected rather than confirmed.  Operator should install
-                    # jq for accurate classification.
-                    if echo "$acl_resp" | grep -q "allUsers" && \
-                       echo "$acl_resp" | grep -qE '(objectCreator|objectAdmin|legacyBucketWriter|storage\.admin)'; then
-                        echo "${gcs_url}  # SUSPECTED (install jq for precise check)" >> "$gcs_writable"
-                    fi
-                fi
-                ;;
-            403)
-                echo "$gcs_url" >> "$gcs_exists"
-                ;;
+        # ── Existence probe via the JSON bucket-get endpoint ─────────────────
+        # 200 = bucket metadata public; 401/403 = exists but locked.
+        local meta_rc
+        meta_rc=$(curl -sk --max-time 8 -o /dev/null -w "%{http_code}" \
+            "https://storage.googleapis.com/storage/v1/b/${name}")
+        case "$meta_rc" in
+            200|401|403) echo "$gcs_url" >> "$gcs_exists" ;;
+            *) return ;;   # NXDOMAIN / 404 / 5xx — not a real bucket; drop it.
         esac
+
+        # ── True readability gate: anonymous Objects:list must return items ──
+        # We fetch one page and require the response to be a valid listing JSON.
+        local list_resp
+        list_resp=$(curl -sk --max-time 8 \
+            "https://storage.googleapis.com/storage/v1/b/${name}/o?maxResults=10" 2>/dev/null)
+
+        local is_listable=false
+        if command -v jq >/dev/null 2>&1; then
+            # Valid listing kind AND no error object ⇒ anonymous list works.
+            if echo "$list_resp" | jq -e \
+                'select(.kind == "storage#objects") | (.items? // [])' \
+                >/dev/null 2>&1; then
+                is_listable=true
+            fi
+        else
+            # jq-less fallback: must look like an objects listing, not an error.
+            if echo "$list_resp" | grep -q '"kind"[[:space:]]*:[[:space:]]*"storage#objects"' \
+               && ! echo "$list_resp" | grep -q '"error"'; then
+                is_listable=true
+            fi
+        fi
+
+        # Bucket exists but anonymous listing is denied — record existence only.
+        [ "$is_listable" = true ] || return
+
+        # ── Ownership corroboration ──────────────────────────────────────────
+        # Signal A: bucket name contains the base company token (≥4 chars to
+        #           avoid trivial substring collisions on short tokens).
+        # Signal B: a listed object name contains the base token.
+        local owned=false
+        if [ -n "$base_tok" ] && [ "${#base_tok}" -ge 4 ] \
+           && [[ "$name" == *"$base_tok"* ]]; then
+            owned=true
+        fi
+        if [ "$owned" = false ] && [ -n "$base_tok" ] && [ "${#base_tok}" -ge 4 ]; then
+            if command -v jq >/dev/null 2>&1; then
+                echo "$list_resp" \
+                    | jq -r '.items[]?.name // empty' 2>/dev/null \
+                    | grep -qiF "$base_tok" && owned=true
+            else
+                echo "$list_resp" | grep -qiF "$base_tok" && owned=true
+            fi
+        fi
+
+        if [ "$owned" = false ]; then
+            # Listable but NOT corroborated as the target's — quarantine it.
+            # Global-namespace collision (e.g. someone else's "api-media").
+            echo "${gcs_url}  # UNVERIFIED: listable but no target ownership signal" \
+                >> "$gcs_unverified"
+            return
+        fi
+
+        # ── Confirmed: target-owned + anonymously listable ───────────────────
+        echo "$gcs_url" >> "$gcs_readable"
+
+        # ── Writability: read-only IAM inference (NO write attempt) ──────────
+        #   roles/storage.objectCreator      — create/overwrite objects
+        #   roles/storage.objectAdmin        — full object control
+        #   roles/storage.legacyBucketWriter — ACL-based write
+        #   roles/storage.admin              — full bucket control
+        # Require `allUsers` (or `allAuthenticatedUsers`) to be a MEMBER of a
+        # binding whose ROLE is write-capable — parsed structurally with jq so a
+        # read binding for allUsers plus an unrelated write binding for another
+        # principal does not produce a false "writable".
+        local acl_resp
+        acl_resp=$(curl -sk --max-time 5 \
+            "https://storage.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null)
+        if command -v jq >/dev/null 2>&1; then
+            if echo "$acl_resp" | jq -e '
+                .bindings[]?
+                | select(.role | test("(objectCreator|objectAdmin|legacyBucketWriter|storage\\.admin)"))
+                | .members[]?
+                | select(. == "allUsers" or . == "allAuthenticatedUsers")
+            ' >/dev/null 2>&1; then
+                echo "$gcs_url" >> "$gcs_writable"
+            fi
+        else
+            if echo "$acl_resp" | grep -qE 'allUsers|allAuthenticatedUsers' && \
+               echo "$acl_resp" | grep -qE '(objectCreator|objectAdmin|legacyBucketWriter|storage\.admin)'; then
+                echo "${gcs_url}  # SUSPECTED (install jq for precise check)" >> "$gcs_writable"
+            fi
+        fi
     }
     export -f _check_gcs_bucket
 
+    touch "$cdir/gcs/unverified.txt"
     cat "$candidates_file" | xargs -P "$CLOUD_ENUM_THREADS" -I {} \
-        bash -c 'set -uo pipefail; _check_gcs_bucket "$@"' _ {} "$gcs_exists" "$gcs_readable" "$gcs_writable" 2>/dev/null || true
+        bash -c 'set -uo pipefail; _check_gcs_bucket "$@"' _ {} "$gcs_exists" "$gcs_readable" "$gcs_writable" "$base_name" 2>/dev/null || true
 
     unset -f _check_gcs_bucket
+
+    local gcs_unverified_count
+    gcs_unverified_count=$(count_lines "$cdir/gcs/unverified.txt")
+    [ "$gcs_unverified_count" -gt 0 ] && \
+        info "  GCS: $gcs_unverified_count listable bucket(s) with no target-ownership signal quarantined → gcs/unverified.txt (likely global-namespace collisions, NOT reported)"
 
     # Report readable GCS findings after parallel run completes
     if [ -s "$gcs_readable" ]; then
@@ -1458,7 +1539,11 @@ phase5_url_discovery() {
         > "$p5dir/gau-urls.txt"
     success "GAU: $(count_lines "$p5dir/gau-urls.txt") URLs"
 
-    # 5.6 Merge all URL sources — explicit list prevents self-inclusion bug
+    # 5.6 Merge all URL sources — explicit list prevents self-inclusion bug.
+    # NOTE: this produces the RAW corpus.  Wayback/GAU dump every path a domain
+    # ever served — dead links, 404s, third-party junk, and infinite querystring
+    # permutations — so the raw set is mostly noise.  We refine it in 5.6b before
+    # anything downstream (categorisation, params, gf, vuln phases) consumes it.
     info "Merging and deduplicating all URL sources..."
     local cloud_p5_feed="$OUTPUT_DIR/phase2.5-cloud/exposed/cloud-urls-for-phase5.txt"
     cat "$p5dir/katana-urls.txt" \
@@ -1467,10 +1552,84 @@ phase5_url_discovery() {
         "$p5dir/wayback-urls.txt" \
         "$p5dir/gau-urls.txt" \
         "${cloud_p5_feed:-/dev/null}" \
-        2>/dev/null | sort -u > "$p5dir/all-urls.txt"
-    success "Total unique URLs: $(count_lines "$p5dir/all-urls.txt")"
+        2>/dev/null | sort -u > "$p5dir/all-urls-raw.txt"
+    local raw_count
+    raw_count=$(count_lines "$p5dir/all-urls-raw.txt")
+    success "Raw merged URLs: $raw_count"
 
-    # 5.7 Categorize URLs by content type
+    # ── 5.6b Refine the corpus: scope → parameter-collapse → liveness ─────────
+    # Three-stage reduction.  Each stage writes an intermediate so the operator
+    # can audit exactly where volume was shed.  The cloud bucket feed is exempt
+    # from the scope filter (bucket URLs live on storage.googleapis.com, not on
+    # the target apex) but is re-added AFTER scoping so it still reaches Phase 7.
+    info "Refining URL corpus (scope → dedup → liveness)..."
+
+    # Stage 1 — SCOPE: drop URLs whose host is not the target or a subdomain.
+    # This removes third-party CDNs, trackers, and sibling-domain noise that
+    # Wayback/GAU pull in.  in_scope refuses to run on an empty TARGET, so guard.
+    local scoped="$p5dir/.urls-scoped.txt"
+    if [ -n "${TARGET:-}" ]; then
+        in_scope < "$p5dir/all-urls-raw.txt" 2>/dev/null | sort -u > "$scoped" || cp "$p5dir/all-urls-raw.txt" "$scoped"
+    else
+        cp "$p5dir/all-urls-raw.txt" "$scoped"
+    fi
+    info "  Scope filter: $(count_lines "$scoped") in-scope (from $raw_count)"
+
+    # Stage 2 — PARAMETER COLLAPSE: ?id=1, ?id=2, ?id=3 are ONE endpoint, not
+    # three.  Collapse by normalising every query VALUE to a constant while
+    # keeping the parameter KEYS, then dedup.  This is typically the single
+    # biggest reduction in a Wayback-heavy corpus.  We keep one concrete
+    # representative URL per normalised signature (the first seen) so downstream
+    # tools still receive a fetchable URL, not a templated one.
+    local collapsed="$p5dir/.urls-collapsed.txt"
+    awk '
+        {
+            url = $0
+            sig = url
+            # Normalise each "key=value" so value becomes a constant token.
+            gsub(/=[^&]*/, "=", sig)
+            if (!(sig in seen)) {
+                seen[sig] = 1
+                print url
+            }
+        }
+    ' "$scoped" > "$collapsed"
+    info "  Param-collapse: $(count_lines "$collapsed") unique endpoints (from $(count_lines "$scoped"))"
+
+    # Stage 3 — LIVENESS: probe the collapsed set with httpx and keep only URLs
+    # that actually respond now.  Historical miners are full of long-dead paths;
+    # validating here stops every later phase from chasing 404s.  We accept the
+    # common "alive" status classes (not just 200) so we don't discard
+    # interesting 401/403/500 endpoints, but we DO drop dead 404/410/gone hosts.
+    local clean="$p5dir/all-urls.txt"
+    if [ -s "$collapsed" ] && check_command "httpx-toolkit"; then
+        httpx-toolkit -l "$collapsed" \
+            -silent \
+            -mc 200,201,202,204,301,302,307,308,401,403,405,500 \
+            -random-agent \
+            -rl 50 \
+            -o "$clean" 2>/dev/null || cp "$collapsed" "$clean"
+        # httpx may emit nothing on a total miss; fall back so we never blank the
+        # corpus and starve downstream phases.
+        [ -s "$clean" ] || cp "$collapsed" "$clean"
+    else
+        warn "  httpx-toolkit unavailable — skipping liveness validation (corpus may contain dead URLs)."
+        cp "$collapsed" "$clean"
+    fi
+
+    # Re-attach the cloud bucket feed (scope-exempt) so confirmed exposed
+    # buckets still flow into categorisation and Phase 7 even though their host
+    # is storage.googleapis.com rather than the target.
+    if [ -n "${cloud_p5_feed:-}" ] && [ -s "$cloud_p5_feed" ]; then
+        cat "$cloud_p5_feed" >> "$clean"
+    fi
+    sort -u -o "$clean" "$clean"
+
+    rm -f "$scoped" "$collapsed"
+    success "Refined URL corpus: $(count_lines "$clean") live, in-scope, deduplicated URLs (from $raw_count raw)"
+
+    # 5.7 Categorize URLs by content type — now runs on the CLEAN corpus, so the
+    # category files inherit the liveness/scope/dedup reductions automatically.
     info "Categorizing URLs by type..."
 
     grep -iE '\.(js|json|xml|config|yml|yaml|env|bak|backup|sql|db|log)(\?.*)?$' \
@@ -3050,7 +3209,8 @@ PORT SCANNING:
   Web on Alt Ports   : $(count_lines "$OUTPUT_DIR/phase4-portscan/services-on-ports.txt")
 
 URL DISCOVERY:
-  Total URLs         : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls.txt")
+  Raw Merged URLs    : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls-raw.txt")
+  Refined URLs       : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls.txt")  [live, in-scope, param-collapsed]
   API Endpoints      : $(count_lines "$OUTPUT_DIR/phase5-urls/api-endpoints.txt")
   Sensitive Endpoints: $(count_lines "$OUTPUT_DIR/phase5-urls/sensitive-endpoints.txt")
   Live JS Files      : $(count_lines "$OUTPUT_DIR/phase5-urls/live-js-files.txt")
@@ -3072,6 +3232,7 @@ CLOUD STORAGE:
   S3 WRITABLE (CRITICAL) : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/s3/writable.txt")
   GCS Buckets Found      : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/gcs/exists.txt")
   GCS Readable           : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/gcs/readable.txt")
+  GCS Unverified (NOTE)  : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/gcs/unverified.txt")  [listable but no target-ownership signal — likely namespace collisions, NOT reported]
   Azure Accounts Found   : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/azure/exists.txt")
   Azure Readable         : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/azure/readable.txt")
   Total Exposed          : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/exposed/all-exposed-buckets.txt")
