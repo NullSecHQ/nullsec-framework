@@ -1557,16 +1557,33 @@ phase5_url_discovery() {
     raw_count=$(count_lines "$p5dir/all-urls-raw.txt")
     success "Raw merged URLs: $raw_count"
 
-    # ── 5.6b Refine the corpus: scope → parameter-collapse → liveness ─────────
-    # Three-stage reduction.  Each stage writes an intermediate so the operator
-    # can audit exactly where volume was shed.  The cloud bucket feed is exempt
-    # from the scope filter (bucket URLs live on storage.googleapis.com, not on
-    # the target apex) but is re-added AFTER scoping so it still reaches Phase 7.
-    info "Refining URL corpus (scope → dedup → liveness)..."
+    # ── 5.6b Refine the corpus — DUAL OUTPUT ──────────────────────────────────
+    # The refinement produces TWO corpora because different consumers need
+    # different inputs:
+    #
+    #   all-urls.txt            (CLEAN)  scoped → param-collapsed → liveness.
+    #                                    For categorisation, parameter mining,
+    #                                    reporting, screenshots.  Low noise.
+    #
+    #   all-urls-injectable.txt (FULL)   scoped → parametered-only.  NOT collapsed,
+    #                                    NOT liveness-filtered.  Every distinct
+    #                                    param=value pair is preserved because
+    #                                    injection testing (gf, sqlmap, dalfox,
+    #                                    IDOR) needs concrete distinct values and
+    #                                    must see endpoints whose BASELINE status
+    #                                    is 404/500/etc (those are often the most
+    #                                    injectable).  Collapsing or liveness-
+    #                                    gating this set is what starved SQLi/XSS.
+    #
+    # Rationale for the split: param-collapse and a fixed liveness whitelist are
+    # correct for building a tidy endpoint inventory, but actively harmful for
+    # vuln testing — ?id=1/?id=2/?id=947 collapse to one URL, and an endpoint
+    # that 500s on a probe gets dropped though it is a prime SQLi target.  We
+    # therefore optimise each corpus for its job instead of forcing one to serve
+    # both.
+    info "Refining URL corpus (scope → dedup → liveness; + full injectable set)..."
 
-    # Stage 1 — SCOPE: drop URLs whose host is not the target or a subdomain.
-    # This removes third-party CDNs, trackers, and sibling-domain noise that
-    # Wayback/GAU pull in.  in_scope refuses to run on an empty TARGET, so guard.
+    # Stage 1 — SCOPE (shared by both corpora).
     local scoped="$p5dir/.urls-scoped.txt"
     if [ -n "${TARGET:-}" ]; then
         in_scope < "$p5dir/all-urls-raw.txt" 2>/dev/null | sort -u > "$scoped" || cp "$p5dir/all-urls-raw.txt" "$scoped"
@@ -1575,19 +1592,21 @@ phase5_url_discovery() {
     fi
     info "  Scope filter: $(count_lines "$scoped") in-scope (from $raw_count)"
 
-    # Stage 2 — PARAMETER COLLAPSE: ?id=1, ?id=2, ?id=3 are ONE endpoint, not
-    # three.  Collapse by normalising every query VALUE to a constant while
-    # keeping the parameter KEYS, then dedup.  This is typically the single
-    # biggest reduction in a Wayback-heavy corpus.  We keep one concrete
-    # representative URL per normalised signature (the first seen) so downstream
-    # tools still receive a fetchable URL, not a templated one.
+    # ── FULL injectable corpus: every scoped URL that carries a query parameter,
+    #    de-duplicated EXACTLY (not by signature) so distinct values survive.
+    #    This is the source of truth for Phase 9 injection tools and Phase 8 JS.
+    local injectable="$p5dir/all-urls-injectable.txt"
+    grep -E '\?[^[:space:]]*=' "$scoped" 2>/dev/null | sort -u > "$injectable" || touch "$injectable"
+    info "  Injectable corpus (parametered, full-value): $(count_lines "$injectable") URLs"
+
+    # Stage 2 — PARAMETER COLLAPSE (CLEAN corpus only).  ?id=1/?id=2/?id=3 → one
+    # representative endpoint.  This drives the tidy inventory, not vuln testing.
     local collapsed="$p5dir/.urls-collapsed.txt"
     awk '
         {
             url = $0
             sig = url
-            # Normalise each "key=value" so value becomes a constant token.
-            gsub(/=[^&]*/, "=", sig)
+            gsub(/=[^&]*/, "=", sig)   # blank every query value for signature
             if (!(sig in seen)) {
                 seen[sig] = 1
                 print url
@@ -1596,11 +1615,7 @@ phase5_url_discovery() {
     ' "$scoped" > "$collapsed"
     info "  Param-collapse: $(count_lines "$collapsed") unique endpoints (from $(count_lines "$scoped"))"
 
-    # Stage 3 — LIVENESS: probe the collapsed set with httpx and keep only URLs
-    # that actually respond now.  Historical miners are full of long-dead paths;
-    # validating here stops every later phase from chasing 404s.  We accept the
-    # common "alive" status classes (not just 200) so we don't discard
-    # interesting 401/403/500 endpoints, but we DO drop dead 404/410/gone hosts.
+    # Stage 3 — LIVENESS (CLEAN corpus only).  Probe collapsed set; keep live.
     local clean="$p5dir/all-urls.txt"
     if [ -s "$collapsed" ] && check_command "httpx-toolkit"; then
         httpx-toolkit -l "$collapsed" \
@@ -1609,27 +1624,26 @@ phase5_url_discovery() {
             -random-agent \
             -rl 50 \
             -o "$clean" 2>/dev/null || cp "$collapsed" "$clean"
-        # httpx may emit nothing on a total miss; fall back so we never blank the
-        # corpus and starve downstream phases.
         [ -s "$clean" ] || cp "$collapsed" "$clean"
     else
         warn "  httpx-toolkit unavailable — skipping liveness validation (corpus may contain dead URLs)."
         cp "$collapsed" "$clean"
     fi
 
-    # Re-attach the cloud bucket feed (scope-exempt) so confirmed exposed
-    # buckets still flow into categorisation and Phase 7 even though their host
-    # is storage.googleapis.com rather than the target.
+    # Re-attach the cloud bucket feed (scope-exempt) to the CLEAN corpus only.
     if [ -n "${cloud_p5_feed:-}" ] && [ -s "$cloud_p5_feed" ]; then
         cat "$cloud_p5_feed" >> "$clean"
     fi
     sort -u -o "$clean" "$clean"
 
-    rm -f "$scoped" "$collapsed"
-    success "Refined URL corpus: $(count_lines "$clean") live, in-scope, deduplicated URLs (from $raw_count raw)"
+    success "Refined URL corpus: $(count_lines "$clean") clean endpoints / $(count_lines "$injectable") injectable URLs (from $raw_count raw)"
 
-    # 5.7 Categorize URLs by content type — now runs on the CLEAN corpus, so the
-    # category files inherit the liveness/scope/dedup reductions automatically.
+    # NOTE: $scoped is intentionally retained until after JS extraction below,
+    # because JS discovery must run on the PRE-collapse, PRE-liveness set so that
+    # cache-busted (app.js?v=HASH) and CDN-served JS are not dropped before the
+    # dedicated JS validation in 5.8.  It is removed at the end of 5.8.
+
+    # 5.7 Categorize URLs by content type — CLEAN corpus for the tidy categories.
     info "Categorizing URLs by type..."
 
     grep -iE '\.(js|json|xml|config|yml|yaml|env|bak|backup|sql|db|log)(\?.*)?$' \
@@ -1642,26 +1656,56 @@ phase5_url_discovery() {
     grep -iE '(admin|login|dashboard|upload|config|backup|dev|staging|test|debug|manage|panel)' \
         "$p5dir/all-urls.txt" > "$p5dir/sensitive-endpoints.txt" 2>/dev/null || touch "$p5dir/sensitive-endpoints.txt"
 
-    grep -iE '\.js(\?.*)?$' \
-        "$p5dir/all-urls.txt" > "$p5dir/all-js-files.txt" 2>/dev/null || touch "$p5dir/all-js-files.txt"
+    # 5.8 JS discovery + validation.
+    # Source from the SCOPED set (pre-collapse/pre-liveness) so no live JS is lost
+    # upstream.  De-dup .js URLs by path (ignoring cache-buster query) to avoid
+    # validating the same file 100x, but KEEP one representative per distinct path
+    # INCLUDING its query so conditional/CDN serving still resolves.
+    grep -iE '\.js(\?.*)?$' "$scoped" 2>/dev/null \
+        | awk '{ p=$0; sub(/\?.*/,"",p); if(!(p in s)){s[p]=1; print} }' \
+        > "$p5dir/all-js-files.txt" 2>/dev/null || touch "$p5dir/all-js-files.txt"
+    info "  Candidate JS files (pre-validation): $(count_lines "$p5dir/all-js-files.txt")"
 
-    # 5.8 Validate live JS files (200 OK only)
+    # Validate live JS — accept 200 and 304 (CDNs answer conditional GETs with
+    # 304) and follow redirects to hashed filenames, so real assets aren't lost.
     if [ -s "$p5dir/all-js-files.txt" ]; then
-        httpx-toolkit -l "$p5dir/all-js-files.txt" \
-            -silent -mc 200 \
-            -random-agent \
-            -rl 50 \
-            -o "$p5dir/live-js-files.txt" 2>/dev/null
+        if check_command "httpx-toolkit"; then
+            httpx-toolkit -l "$p5dir/all-js-files.txt" \
+                -silent -mc 200,304 \
+                -follow-redirects \
+                -random-agent \
+                -rl 50 \
+                -o "$p5dir/live-js-files.txt" 2>/dev/null
+            # Fallback: if validation yields nothing but candidates exist, the
+            # origin is likely throttling/blocking httpx — keep the candidate set
+            # so Phase 8 can still attempt extraction rather than skipping.
+            if [ ! -s "$p5dir/live-js-files.txt" ]; then
+                warn "  JS liveness returned 0 (possible WAF/rate-limit) — passing candidate JS through to Phase 8."
+                cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+            fi
+        else
+            cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+        fi
         success "Live JS files: $(count_lines "$p5dir/live-js-files.txt")"
+    else
+        touch "$p5dir/live-js-files.txt"
+        info "No .js URLs discovered in corpus."
     fi
 
-    # 5.9 GF pattern matching — tomnomnom/gf gives higher-signal URL filtering
+    rm -f "$scoped" "$collapsed"
+
+    # 5.9 GF pattern matching — tomnomnom/gf gives higher-signal URL filtering.
+    # Runs on the FULL injectable corpus (all distinct param=value pairs), NOT
+    # the collapsed clean corpus — gf feeds the injection tools in Phase 9, which
+    # need every distinct value, not one representative per endpoint signature.
     if check_command "gf"; then
-        info "Running GF pattern matching on all URLs..."
+        local gf_source="$p5dir/all-urls-injectable.txt"
+        [ -s "$gf_source" ] || gf_source="$p5dir/all-urls.txt"   # fallback
+        info "Running GF pattern matching on injectable corpus ($(count_lines "$gf_source") URLs)..."
         for pattern in xss sqli ssrf redirect lfi idor; do
             # Check if the gf pattern is actually installed before running
             if gf -list 2>/dev/null | grep -q "^$pattern$"; then
-                gf "$pattern" "$p5dir/all-urls.txt" \
+                gf "$pattern" "$gf_source" \
                     > "$p5dir/gf-$pattern.txt" 2>/dev/null || touch "$p5dir/gf-$pattern.txt"
                 local cnt
                 cnt=$(count_lines "$p5dir/gf-$pattern.txt")
@@ -2567,7 +2611,12 @@ phase9_pattern_hunting() {
     local p5dir="$OUTPUT_DIR/phase5-urls"
     local p9dir="$OUTPUT_DIR/phase9-patterns"
     local p3dir="$OUTPUT_DIR/phase3-probing"
-    local url_source="$p5dir/all-urls.txt"
+    # Injection candidate sourcing: prefer the FULL injectable corpus (all
+    # distinct param=value pairs, not liveness-gated) so SQLi/XSS/SSRF/LFI/IDOR
+    # grep fallbacks see every testable value.  Fall back to the clean corpus
+    # only if the injectable set is empty (e.g. target had no parametered URLs).
+    local url_source="$p5dir/all-urls-injectable.txt"
+    [ -s "$url_source" ] || url_source="$p5dir/all-urls.txt"
 
     # 9.1 SSRF candidates — prefer gf output (higher signal) over grep
     info "Finding SSRF candidates..."
@@ -2600,26 +2649,34 @@ phase9_pattern_hunting() {
     success "XSS candidates: $(count_lines "$p9dir/xss-candidates.txt")"
 
     if check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
-        local xss_total
+        # Dedup candidates by INJECTION-POINT signature (host+path+param-keys),
+        # keeping one concrete value per signature, BEFORE applying the cap.
+        # Without this, head -N wastes the budget on ?id=1, ?id=2, ?id=3 — the
+        # same injection point tested repeatedly.  After dedup, each of the N
+        # capped slots is a DISTINCT injection point, so the same timeout budget
+        # covers far more real attack surface.  This is the main reason dalfox
+        # previously timed out without finding anything.
+        awk '{ s=$0; gsub(/=[^&]*/,"=",s); if(!(seen[s]++)) print }' \
+            "$p9dir/xss-candidates.txt" > "$p9dir/xss-candidates-dedup.txt"
+        local xss_total xss_uniq
         xss_total=$(count_lines "$p9dir/xss-candidates.txt")
-        info "Running Dalfox XSS testing (cap: ${XSS_CANDIDATE_CAP} of ${xss_total} candidates, delay: ${DALFOX_DELAY}ms, timeout: ${DALFOX_TIMEOUT}s)..."
+        xss_uniq=$(count_lines "$p9dir/xss-candidates-dedup.txt")
+        info "Running Dalfox XSS testing (cap: ${XSS_CANDIDATE_CAP} of ${xss_uniq} distinct injection points; ${xss_total} raw candidates, delay: ${DALFOX_DELAY}ms, timeout: ${DALFOX_TIMEOUT}s)..."
 
-        # Asset-scored top targets are already in score order (highest first) thanks
-        # to Phase 6b.  head -N feeds the highest-value URLs into dalfox so the cap
-        # spends its budget on the best candidates, not random ones.
-        #
         # `timeout DALFOX_TIMEOUT` is the primary guard against infinite hangs.
-        # XSS_CANDIDATE_CAP is the secondary guard — even without timeout, dalfox
-        # sees at most this many URLs.  Both are set per scan-mode in apply_scan_mode.
-        #
-        # SIGTERM is sent first; dalfox writes confirmed findings incrementally so
-        # partial output is safe.  timeout sends SIGKILL after a further 30 s if the
-        # process doesn't exit cleanly on SIGTERM.
-        head -"${XSS_CANDIDATE_CAP}" "$p9dir/xss-candidates.txt" \
+        # XSS_CANDIDATE_CAP bounds the input set.  --worker limits in-flight
+        # requests so a throttling WAF doesn't tarpit us into the wall-clock
+        # timeout, and per-request --timeout 10 stops a single hung request from
+        # eating the whole budget.  dalfox writes findings incrementally, so a
+        # timeout still preserves partial confirmed output.
+        head -"${XSS_CANDIDATE_CAP}" "$p9dir/xss-candidates-dedup.txt" \
             | timeout --kill-after=30 "${DALFOX_TIMEOUT}" \
                 dalfox pipe \
                 --silence \
                 --no-color \
+                --skip-bav \
+                --worker 10 \
+                --timeout 10 \
                 --delay "${DALFOX_DELAY}" \
                 --output "$p9dir/dalfox-xss-confirmed.txt" 2>/dev/null
         local dalfox_exit=$?
@@ -2646,10 +2703,18 @@ phase9_pattern_hunting() {
     success "SQLi candidates: $(count_lines "$p9dir/sqli-candidates.txt")"
 
     if check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
-        local sqli_total
+        # Dedup by injection-point signature first (same rationale as dalfox):
+        # without it, the cap is spent re-testing ?id=1/?id=2 instead of distinct
+        # injectable endpoints.  sqlmap detects injection from the parameter, not
+        # the specific value, so one representative per signature is sufficient
+        # and dramatically widens coverage under the same cap/timeout.
+        awk '{ s=$0; gsub(/=[^&]*/,"=",s); if(!(seen[s]++)) print }' \
+            "$p9dir/sqli-candidates.txt" > "$p9dir/sqli-candidates-dedup.txt"
+        local sqli_total sqli_uniq
         sqli_total=$(count_lines "$p9dir/sqli-candidates.txt")
-        info "Running SQLMap on up to ${SQLI_CANDIDATE_CAP} of ${sqli_total} SQLi candidates (batch, timeout: ${SQLMAP_TIMEOUT}s)..."
-        head -"${SQLI_CANDIDATE_CAP}" "$p9dir/sqli-candidates.txt" \
+        sqli_uniq=$(count_lines "$p9dir/sqli-candidates-dedup.txt")
+        info "Running SQLMap on up to ${SQLI_CANDIDATE_CAP} of ${sqli_uniq} distinct injection points (${sqli_total} raw; timeout: ${SQLMAP_TIMEOUT}s)..."
+        head -"${SQLI_CANDIDATE_CAP}" "$p9dir/sqli-candidates-dedup.txt" \
             > "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt"
 
         # Build a regex scope pattern from the target domain so SQLMap
@@ -2657,14 +2722,19 @@ phase9_pattern_hunting() {
         local escaped_target
         escaped_target=$(echo "$TARGET" | sed 's/\./\\./g')
 
-        # timeout prevents sqlmap from running indefinitely on slow/deep targets.
+        # level=2/risk=2 broadens coverage (more parameters incl. Cookie/headers
+        # and more injection techniques) without entering destructive risk=3
+        # territory — appropriate for a VDP.  --threads parallelises within a
+        # target; per-request --timeout + capped --retries keep a throttling WAF
+        # from stalling the whole batch into the wall-clock timeout.
         timeout --kill-after=30 "${SQLMAP_TIMEOUT}" \
             sqlmap -m "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" \
                 --batch \
                 --smart \
-                --level=1 \
-                --risk=1 \
-                --delay=2 \
+                --level=2 \
+                --risk=2 \
+                --threads=4 \
+                --delay=1 \
                 --random-agent \
                 --scope="https?://([a-zA-Z0-9._-]+\\.)?${escaped_target}" \
                 --tamper=between,randomcase \
@@ -3227,6 +3297,7 @@ PORT SCANNING:
 URL DISCOVERY:
   Raw Merged URLs    : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls-raw.txt")
   Refined URLs       : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls.txt")  [live, in-scope, param-collapsed]
+  Injectable URLs    : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls-injectable.txt")  [full param values — feeds SQLi/XSS/IDOR]
   API Endpoints      : $(count_lines "$OUTPUT_DIR/phase5-urls/api-endpoints.txt")
   Sensitive Endpoints: $(count_lines "$OUTPUT_DIR/phase5-urls/sensitive-endpoints.txt")
   Live JS Files      : $(count_lines "$OUTPUT_DIR/phase5-urls/live-js-files.txt")
