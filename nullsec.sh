@@ -65,9 +65,12 @@ AWS_REGIONS=("us-east-1" "us-west-2" "eu-west-1" "ap-southeast-1")
 # DALFOX_TIMEOUT      wall-clock seconds before `timeout` kills dalfox.  Prevents
 #                     the 3-hour hang seen when feeding hundreds of XSS candidates
 #                     at 300 ms each with no ceiling.
-# XSS_CANDIDATE_CAP   URLs fed to dalfox (head -N).  Second line of defence after
-#                     DALFOX_TIMEOUT; ensures even without timeout the set is bounded.
-# SQLI_CANDIDATE_CAP  URLs fed to sqlmap per Phase 9 run.
+# XSS_CANDIDATE_CAP   Distinct injection points fed to dalfox (head -N AFTER
+#                     dedup by host+path+param-keys).  Each unit is one real
+#                     injection point, not a raw URL — much smaller than pre-dedup.
+# DALFOX_WORKERS      dalfox concurrent workers (--worker).  Lower = gentler on
+#                     the target / less likely to trip a WAF; higher = faster.
+# SQLI_CANDIDATE_CAP  Distinct injection points fed to sqlmap per Phase 9 run.
 # SQLMAP_TIMEOUT      wall-clock seconds before `timeout` kills sqlmap.
 # FFUF_TIMEOUT        wall-clock seconds per ffuf host invocation in Phase 11.
 # PHASE9_WALL_TIMEOUT hard ceiling (seconds) on the whole Phase 9 function;
@@ -75,6 +78,7 @@ AWS_REGIONS=("us-east-1" "us-west-2" "eu-west-1" "ap-southeast-1")
 # PHASE11_WALL_TIMEOUT hard ceiling (seconds) on the whole Phase 11 function.
 DALFOX_DELAY=100
 DALFOX_TIMEOUT=1800
+DALFOX_WORKERS=10
 XSS_CANDIDATE_CAP=500
 SQLI_CANDIDATE_CAP=10
 SQLMAP_TIMEOUT=1800
@@ -452,10 +456,14 @@ apply_scan_mode() {
 
             # Phase 9 / 11 timing — fast mode skips both phases entirely, but
             # set conservative floors in case flags are overridden manually.
+            # NOTE: candidate caps now bound DISTINCT INJECTION POINTS (dedup by
+            # host+path+param-keys runs BEFORE the cap), not raw URLs — so these
+            # numbers are far smaller than pre-dedup and each unit is real work.
             # DALFOX_DELAY floor is 50 ms; never set lower on live targets.
             DALFOX_DELAY=50
             DALFOX_TIMEOUT=600          # 10 min hard cap
-            XSS_CANDIDATE_CAP=100
+            DALFOX_WORKERS=15           # higher concurrency; fast mode prioritises speed
+            XSS_CANDIDATE_CAP=25        # distinct injection points
             SQLI_CANDIDATE_CAP=5
             SQLMAP_TIMEOUT=300          # 5 min
             FFUF_TIMEOUT=120            # 2 min per host
@@ -492,11 +500,18 @@ apply_scan_mode() {
             NUCLEI_CONCURRENCY=25  # balanced; stays under MHE default (30)
 
             # Phase 9 / 11 timing — normal mode runs both phases.
-            # 100 ms delay ≈ 10 req/s ceiling, well within programme tolerances.
+            # Caps bound DISTINCT INJECTION POINTS (post-dedup), so these are much
+            # smaller than the old raw-URL caps and each unit is genuine testing.
+            # The timeout is a SAFETY NET for true hangs, not a per-run guillotine:
+            # 100 distinct points × dalfox's internal payload set at 100 ms,
+            # parallelised across DALFOX_WORKERS, completes well inside 30 min on a
+            # responsive target. If it hits the ceiling, that signals throttling
+            # (a WAF tarpit), not insufficient budget — raising it would not help.
             DALFOX_DELAY=100
-            DALFOX_TIMEOUT=1800         # 30 min — enough for 500 URLs at 100 ms each
-            XSS_CANDIDATE_CAP=500
-            SQLI_CANDIDATE_CAP=10
+            DALFOX_TIMEOUT=1800         # 30 min safety net
+            DALFOX_WORKERS=10
+            XSS_CANDIDATE_CAP=100       # distinct injection points
+            SQLI_CANDIDATE_CAP=15
             SQLMAP_TIMEOUT=1800         # 30 min
             FFUF_TIMEOUT=300            # 5 min per host
             PHASE9_WALL_TIMEOUT=3600    # 60 min absolute ceiling
@@ -536,14 +551,19 @@ apply_scan_mode() {
             MAX_CORS_HOSTS=200
             MAX_BUCKET_MUTATIONS=500    # deeper bucket name generation in deep mode
 
-            # Phase 9 / 11 timing — deep mode is thorough; slower delay, larger
-            # candidate caps, longer timeouts.  Runtime can reach 4+ hours total;
-            # that is expected and documented in the mode description.
-            # 200 ms delay ≈ 5 req/s ceiling — polite for a full deep scan.
+            # Phase 9 / 11 timing — deep mode is thorough but polite: slower
+            # delay, larger caps, longer safety-net timeouts.  Caps bound DISTINCT
+            # INJECTION POINTS (post-dedup).  300 distinct points is already a very
+            # large real attack surface — far more meaningful than the old
+            # raw-URL cap of 1000, which after dedup almost never bit.  Lower
+            # worker count keeps deep scans gentle on the target (politeness >
+            # speed for a thorough weekly run).  60 min is a ceiling for genuine
+            # hangs; a responsive target finishes 300 points well under it.
             DALFOX_DELAY=200
-            DALFOX_TIMEOUT=3600         # 60 min — allows up to ~1000 URLs at 200 ms
-            XSS_CANDIDATE_CAP=1000
-            SQLI_CANDIDATE_CAP=20
+            DALFOX_TIMEOUT=3600         # 60 min safety net
+            DALFOX_WORKERS=6            # gentle concurrency for a polite deep scan
+            XSS_CANDIDATE_CAP=300       # distinct injection points
+            SQLI_CANDIDATE_CAP=30
             SQLMAP_TIMEOUT=3600         # 60 min
             FFUF_TIMEOUT=600            # 10 min per host
             PHASE9_WALL_TIMEOUT=7200    # 120 min absolute ceiling
@@ -2661,7 +2681,7 @@ phase9_pattern_hunting() {
         local xss_total xss_uniq
         xss_total=$(count_lines "$p9dir/xss-candidates.txt")
         xss_uniq=$(count_lines "$p9dir/xss-candidates-dedup.txt")
-        info "Running Dalfox XSS testing (cap: ${XSS_CANDIDATE_CAP} of ${xss_uniq} distinct injection points; ${xss_total} raw candidates, delay: ${DALFOX_DELAY}ms, timeout: ${DALFOX_TIMEOUT}s)..."
+        info "Running Dalfox XSS testing (cap: ${XSS_CANDIDATE_CAP} distinct injection points of ${xss_uniq} found; ${xss_total} raw candidates, delay: ${DALFOX_DELAY}ms, workers: ${DALFOX_WORKERS:-10}, timeout: ${DALFOX_TIMEOUT}s)..."
 
         # `timeout DALFOX_TIMEOUT` is the primary guard against infinite hangs.
         # XSS_CANDIDATE_CAP bounds the input set.  --worker limits in-flight
@@ -2675,7 +2695,7 @@ phase9_pattern_hunting() {
                 --silence \
                 --no-color \
                 --skip-bav \
-                --worker 10 \
+                --worker "${DALFOX_WORKERS:-10}" \
                 --timeout 10 \
                 --delay "${DALFOX_DELAY}" \
                 --output "$p9dir/dalfox-xss-confirmed.txt" 2>/dev/null
@@ -3087,7 +3107,7 @@ phase11_fuzzing() {
             -recursion -recursion-depth 2 \
             -ac \
             -timeout 10 \
-            -silent >/dev/null 2>>"$ffuf_log" &
+            >/dev/null 2>>"$ffuf_log" &
         local ffuf_pid=$!
         # Per-host wall-clock cap prevents a single slow host from blocking the loop
         ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_pid" 2>/dev/null ) &
@@ -3124,7 +3144,7 @@ phase11_fuzzing() {
                 -of json \
                 -ac \
                 -timeout 10 \
-                -silent >/dev/null 2>>"$ffuf_log" &
+                >/dev/null 2>>"$ffuf_log" &
             local ffuf_bak_pid=$!
             ( sleep "$FFUF_TIMEOUT" && kill -TERM "$ffuf_bak_pid" 2>/dev/null ) &
             local watchdog_bak_pid=$!
